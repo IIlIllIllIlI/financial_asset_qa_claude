@@ -82,9 +82,14 @@ over:
 | Validation | Pydantic v2 |
 | ORM | SQLAlchemy |
 | Database | SQLite |
-| Vector Database | Chroma (persist mode) |
-| Embedding Model | BAAI/bge-small-en-v1.5 |
+| Vector Database | langchain-chroma (persist mode) |
+| Embedding Model | langchain-huggingface (BAAI/bge-small-zh-v1.5) |
+| Text Splitting | langchain-text-splitters |
+| Document Loading | langchain-community (PyPDFLoader) |
+| PDF Parsing | pypdf |
 | Streaming | SSE |
+| Web Search | langchain-tavily (TavilySearch) |
+| Web Extract | langchain-tavily (TavilyExtract) |
 | Testing | pytest |
 | Async Testing | pytest-asyncio |
 | HTTP Testing | httpx |
@@ -109,8 +114,10 @@ During development and testing, all LLM tasks use **MiniMax-M2.7**:
 | Task | Model | Method |
 |---|---|---|
 | Intent Classification | MiniMax-M2.7 | function_calling |
+| Ticker Extraction | MiniMax-M2.7 | function_calling |
 | Response Generation | MiniMax-M2.7 | chat completion + streaming |
 | Rerank | MiniMax-M2.7 | chat completion |
+| Merge (Hybrid Flow) | MiniMax-M2.7 | chat completion |
 | Title Generation | MiniMax-M2.7 | chat completion |
 | Unsupported Query Rejection | MiniMax-M2.7 | chat completion |
 
@@ -334,7 +341,7 @@ The center chat area manages:
 - user input
 - loading states (thinking indicator during tool execution)
 - citations display
-- tool execution status (e.g., "Fetching market data...")
+- tool execution status (driven by SSE `status` events: "Fetching market data...", "Searching latest news...", etc.)
 
 ---
 
@@ -438,8 +445,6 @@ Intent classification uses **LLM with function_calling** (NOT keyword matching).
 ```python
 class IntentOutput(BaseModel):
     intent: Literal["market", "rag", "hybrid", "unsupported"]
-    confidence: float
-    reasoning: str
 
 # Usage:
 intent_result = model.with_structured_output(
@@ -448,11 +453,15 @@ intent_result = model.with_structured_output(
 ).invoke(intent_prompt + user_query)
 ```
 
+The LLM directly classifies the intent — no confidence threshold is needed. The intent
+determines the graph route. Ticker extraction is a **separate** LLM call performed
+inside market_node (not part of intent classification).
+
 Intent examples:
-- **market**: "What is Tesla's current stock price?", "Show me AAPL market cap", "How did NVDA perform this week?"
-- **rag**: "What is PE ratio?", "Explain discounted cash flow valuation", "What does EBITDA mean?"
-- **hybrid**: "Why did Tesla stock rise and what does PE ratio indicate?", "Explain NVDA's current valuation based on its PE"
-- **unsupported**: "Write me a poem about stocks", "Tell me a joke"
+- **market**: "特斯拉当前股价是多少？", "显示苹果的市值和市盈率", "英伟达这周股价表现如何？"
+- **rag**: "什么是市盈率？", "解释现金流折现估值法", "EBITDA 是什么意思？"
+- **hybrid**: "为什么特斯拉股价上涨了？市盈率能说明什么？", "基于英伟达的当前市盈率解释其估值"
+- **unsupported**: "写一首关于股票的诗", "给我讲个笑话"
 
 ---
 
@@ -461,27 +470,31 @@ Intent examples:
 ```text
 User Query → Intent Node (routes to "market")
     ↓
-Market Data Tool Node
-    ├── Extract ticker symbol(s) from query via LLM
-    ├── Fetch price, metrics from Yahoo Finance for each ticker
-    └── Normalize and cache results
+Market Data Tool Node (market_node)
+    ├── Ticker Extraction: LLM function_calling extracts ticker symbols (separate
+    │   from intent classification — dedicated LLM call with TickerList schema)
+    ├── Data Fetching: for each ticker, fetch price + history from Yahoo Finance
+    │   (multi-asset = asyncio.gather for parallel fetching)
+    ├── Normalize + cache results per ticker (TTLCache, 60s TTL)
+    └── Store in state.market_data (dict keyed by symbol), state.tickers (list)
     ↓
 News Node (Tavily Search)
     ├── Search for "[TICKER] stock news" for each ticker
-    └── Return top 5 results with URLs and snippets
+    └── Return top 5 results per ticker with URLs and snippets
     ↓
 Extract Node (Tavily Extract)
-    ├── Extract full article text from top 2 news URLs
+    ├── Extract full article text from top 2 news URLs per ticker
     └── Store extracted content in state.extracted_articles
     ↓
-Response Generation Node
+Response Generation Node (generation_node)
     ├── Build market analysis prompt with fetched data + news + extracted articles
-    ├── LLM generates markdown response
-    └── Extract structured_data + citations via function_calling
+    ├── LLM generates markdown response (streaming tokens to frontend)
+    └── Extract citations via function_calling (LLM only extracts citations)
     ↓
-Structured Formatter Node
-    ├── Normalize structured_data (single or multi-asset)
-    ├── Assemble citations
+Structured Formatter Node (formatter_node)
+    ├── Build structured_data.assets[] from state.market_data (ALL from real data:
+    │   symbol, price, change, change_pct, trend, market_metrics, chart_data)
+    ├── Assemble + normalize citations
     └── Set final_response
     ↓
 Stream to Frontend via SSE
@@ -497,18 +510,22 @@ User Query → Intent Node (routes to "rag")
 Retrieval Node
     ├── Embed user query
     ├── Similarity search in Chroma (top-k = 8)
-    └── Return retrieved chunks with metadata
+    └── Return retrieved chunks with metadata (may be empty if no relevant docs)
     ↓
 Lightweight Rerank Node
     ├── LLM selects best chunks from top-k (output top-4)
+    ├── If retrieval returned no chunks: skip rerank, set empty context
     └── Discard irrelevant chunks
     ↓
 Context Builder
     ├── Assemble final context from reranked chunks
-    └── Include document source metadata
+    ├── If context is empty: clearly mark "RAG knowledge base has no relevant content"
+    └── Include document source metadata for non-empty context
     ↓
 Response Generation Node
     ├── Build RAG prompt with context + user query
+    ├── If context is empty: LLM uses its own knowledge, but response MUST
+    │   explicitly state that no relevant documents were found in the knowledge base
     ├── LLM generates grounded markdown response
     └── Extract citations
     ↓
@@ -545,14 +562,17 @@ Stream to Frontend via SSE
 ```
 
 The hybrid flow runs both phases sequentially (market data + news + extract first, then RAG).
-Phase 6 (merge) uses LLM to synthesize all gathered context — market metrics, news articles,
-extracted article full text, and retrieved document chunks — into a single coherent context
-for the generation node.
+Phase 6 (merge) is a **non-streaming LLM call** that synthesizes all gathered context —
+market metrics, news articles, extracted article full text, and retrieved document chunks —
+into a single coherent summary context. This condensed summary is then passed to the
+generation_node. The merge_node output is NOT sent to the frontend — only the
+generation_node's tokens are streamed to the user. The synthesis cost is one extra
+LLM call but results in much better response quality for complex hybrid queries.
 
 Example hybrid query:
 
 ```text
-"Why did Tesla stock fall recently and what does its PE ratio imply?"
+"为什么特斯拉股价下跌？市盈率能说明什么含义？"
 ```
 
 ---
@@ -584,8 +604,9 @@ The system supports queries involving multiple stock tickers (e.g., "Compare TSL
 
 - **Ticker Extraction:** The market_data node uses LLM function calling to extract all
   ticker symbols from the query into `state["tickers"]`.
-- **Data Fetching:** Yahoo Finance data is fetched independently for each ticker.
-  Results are stored in `state["market_data"]` keyed by symbol.
+- **Data Fetching:** Yahoo Finance data is fetched **in parallel** for all tickers
+  via `asyncio.gather(asyncio.to_thread(...) for each ticker)`. Results are stored
+  in `state["market_data"]` keyed by symbol.
 - **News Search:** Tavily search runs for each ticker individually. Results are merged
   into `state["news_data"]`.
 - **Structured Output:** `StructuredData.assets` is a `list[AssetData]`, one entry per ticker.
@@ -610,6 +631,194 @@ when N>1.
 
 ---
 
+## 7.8 Dual-Track Streaming Architecture
+
+The system uses a **dual-track** streaming design — the frontend receives tokens in
+real-time while the graph internally retains the complete markdown for post-processing.
+
+### Design Rationale
+
+```
+Track 1 (SSE):  tokens forwarded to frontend as soon as LLM produces them
+Track 2 (Graph): complete markdown accumulated in state.answer_markdown,
+                 then post-processed by formatter_node after generation
+```
+
+This avoids the common pitfall where structured extraction blocks streaming UX.
+The formatter and structured extraction execute AFTER the full markdown is generated,
+but the frontend has already been rendering tokens incrementally throughout.
+
+### Mechanism
+
+1. **`_token_queue` injection**: an `asyncio.Queue` is attached to `GraphState` at
+   invocation time. It is NOT serialized by LangGraph — it exists only for the
+   duration of one graph execution.
+
+2. **generation_node** is the core of both tracks:
+   - Uses `model.astream_events()` to iterate over tokens
+   - Immediately `await _token_queue.put({"type": "token", "content": token})` for each
+   - Accumulates the full markdown string in `state["answer_markdown"]`
+   - After generation completes: calls `model.with_structured_output()` to extract
+     ONLY `list[Citation]` (market data is NOT extracted from LLM — see formatter_node)
+
+3. **formatter_node** receives the complete `answer_markdown` and fills in ALL
+   market-related fields in `structured_data.assets[]` from `state.market_data`
+   (Yahoo Finance actual data):
+   - `symbol`, `price`, `change`, `change_pct`, `trend`, `market_metrics`, `chart_data`
+   - All of these come from real yfinance data, never LLM-generated.
+   - Also normalizes citations into final format.
+
+4. **SSE endpoint** (`POST /api/chat`) runs the graph in a background `asyncio.Task`
+   while simultaneously reading from `_token_queue` and yielding SSE events.
+
+### Streaming Timeline
+
+```
+T=0ms     User clicks Send → POST /api/chat → SSE connection opened
+T=50ms    intent_node completes
+T=100ms   status: {node: "market_data", status: "running"} → frontend shows "Fetching market data..."
+T=500ms   market_node completes
+T=550ms   status: {node: "news", status: "running"} → frontend shows "Searching latest news..."
+T=1000ms  news_node completes
+T=1050ms  status: {node: "extract", status: "running"} → frontend shows "Extracting article content..."
+T=2000ms  extract_node completes
+T=2050ms  status: {node: "generation", status: "running"} → frontend shows "Generating response..."
+T=2100ms  generation_node starts → LLM begins streaming tokens
+          first "token" event clears status indicator → incremental markdown rendering begins
+T=2100-4000ms  Tokens stream to frontend in real-time (incremental rendering)
+T=4000ms  LLM generation complete → citations extraction runs
+T=4050ms  formatter_node runs → all market data injected into structured_data
+T=4100ms  Graph reaches END → structured_data + citations + done events sent → SSE closes
+```
+
+### SSE Endpoint Implementation
+
+```python
+@router.post("/api/chat")
+async def chat(request: ChatRequest):
+    token_queue: asyncio.Queue = asyncio.Queue()
+
+    # Build initial state with queue injected
+    initial_state = build_initial_state(request, token_queue)
+
+    async def event_stream():
+        # Run graph in background task
+        task = asyncio.create_task(run_graph(initial_state))
+
+        # Forward events from queue to SSE
+        while True:
+            item = await token_queue.get()
+            if item["type"] == "status":
+                yield f"event: status\ndata: {json.dumps({'node': item['node'], 'status': item['status']})}\n\n"
+            elif item["type"] == "token":
+                yield f"event: token\ndata: {json.dumps({'content': item['content']})}\n\n"
+            elif item["type"] == "done":
+                yield f"event: structured_data\ndata: {json.dumps(item['structured_data'])}\n\n"
+                yield f"event: citations\ndata: {json.dumps(item['citations'])}\n\n"
+                yield f"event: done\ndata: {json.dumps({'session_id': item['session_id']})}\n\n"
+                break
+            elif item["type"] == "error":
+                yield f"event: error\ndata: {json.dumps(item['error'])}\n\n"
+                break
+
+        await task  # ensure graph fully completes
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+```
+
+### generation_node Internal Logic
+
+```python
+async def generation_node(state: GraphState) -> GraphState:
+    if state.get("error"):
+        return state
+
+    messages = build_generation_messages(state)  # system prompt + history + context
+    queue = state["_token_queue"]
+    model = get_llm_provider().get_model()
+
+    # Emit status before generation starts
+    await queue.put({"type": "status", "node": "generation", "status": "running"})
+
+    # Track 1 + Track 2: stream tokens AND accumulate
+    full_response = ""
+    async for event in model.astream_events(messages, version="v2"):
+        if event["event"] == "on_chat_model_stream":
+            chunk = event["data"]["chunk"]
+            if chunk.content:
+                full_response += chunk.content
+                await queue.put({"type": "token", "content": chunk.content})
+
+    state["answer_markdown"] = full_response
+
+    # Extract citations only (market data comes from real yfinance data in formatter_node)
+    citations_result = await model.with_structured_output(
+        CitationList, method="function_calling"
+    ).ainvoke(citation_prompt + full_response)
+    state["citations"] = [c.model_dump() for c in citations_result.citations]
+
+    return state
+```
+
+### Node Status Events
+
+Each graph node emits a `status` event to `_token_queue` at the start of its execution
+(before doing any work). This allows the frontend to show a real-time tool execution
+indicator. Example from `market_node`:
+
+```python
+async def market_node(state: GraphState) -> GraphState:
+    if state.get("error"):
+        return state
+    queue = state["_token_queue"]
+    await queue.put({"type": "status", "node": "market_data", "status": "running"})
+    # ... fetch market data ...
+```
+
+Every node follows this pattern. The `generation_node` emits its status event immediately
+before starting `astream_events`; the first `token` event clears the indicator on the
+frontend side. Nodes that are skipped (e.g., `market_data` in RAG-only flow) never emit
+status events.
+
+### Graph Runner
+
+```python
+async def run_graph(state: GraphState) -> None:
+    compiled_graph = get_compiled_graph()
+    queue = state["_token_queue"]
+    try:
+        result = await compiled_graph.ainvoke(state)
+        # Signal SSE stream to complete
+        await queue.put({
+            "type": "done",
+            "structured_data": result.get("structured_data"),
+            "citations": result.get("citations"),
+            "session_id": result["session_id"],
+        })
+    except Exception as e:
+        logger.error(f"Graph execution failed: {e}", exc_info=True)
+        await queue.put({
+            "type": "error",
+            "error": {"type": type(e).__name__, "message": str(e)},
+        })
+```
+
+### Error Handling in Streaming
+
+When a node sets `state["error"]`, subsequent nodes detect it and skip work
+(fail-fast). The graph still reaches END. The `run_graph` function catches
+exceptions at the graph level and sends an SSE `error` event, which immediately
+terminates the stream. The frontend **keeps any partially rendered markdown**
+from tokens already received, then displays the error via a toast notification
+with a retry button. Partial content is preserved so the user can see what was
+generated before the failure.
+
+---
+
 # 8. Typed Graph State
 
 ## 8.1 Strict Typed State
@@ -631,20 +840,26 @@ from typing import TypedDict, Optional
 
 
 class GraphState(TypedDict):
-    """LangGraph workflow state. All fields serializable."""
+    """LangGraph workflow state.
+
+    All fields serializable EXCEPT _token_queue, which is injected at
+    runtime and used only for real-time SSE token forwarding.
+    """
 
     session_id: str
 
     user_query: str
 
     # Reconstructed conversation history (loaded from DB at start)
+    # OpenAI format: [{"role": "user"|"assistant", "content": "..."}]
+    # system prompt is dynamically prepended, not stored in messages
     messages: list[dict]
 
     # Intent routing
     intent: str                      # "market" | "rag" | "hybrid" | "unsupported"
 
     # RAG
-    retrieved_docs: list[dict]       # top-k chunks from Chroma
+    retrieved_docs: list[dict]       # top-k chunks from Chroma (k=8)
     reranked_docs: list[dict]        # top-N chunks after LLM rerank (N=4)
 
     # Market data
@@ -660,10 +875,15 @@ class GraphState(TypedDict):
     structured_data: dict            # active_asset, price, change_pct, trend, metrics, chart_data
 
     # Final output
-    final_response: str              # markdown answer
+    final_response: str              # markdown answer (complete, set by formatter_node)
+    answer_markdown: str             # raw markdown from generation_node (before formatting)
 
     # Error state (fail-fast)
     error: Optional[dict]            # {"type": "...", "message": "..."}
+
+    # Runtime-only: asyncio.Queue for real-time SSE token forwarding
+    # NOT serialized by LangGraph — injected at graph invocation time
+    _token_queue: Any                # asyncio.Queue[dict]
 ```
 
 ---
@@ -686,8 +906,8 @@ State objects must remain:
 
 | Database | Usage | Path |
 |---|---|---|
-| SQLite | relational persistence | `./backend/data/sqlite.db` |
-| Chroma | vector retrieval (persist mode) | `./backend/chroma_db/` |
+| SQLite | relational persistence | `./backend/data/sqlite.db` (created at runtime) |
+| Chroma | vector retrieval (persist mode) | `./backend/chroma_db/` (via langchain-chroma) |
 
 ---
 
@@ -710,13 +930,27 @@ SQLite does NOT store:
 
 ## 9.3 Chroma Responsibilities
 
-Chroma (persist mode) stores:
+Chroma (via `langchain-chroma`, persist mode) stores:
 
 - document chunks
 - embeddings
 - vector metadata
 
-Chroma data persists across restarts — no need to re-ingest documents on every startup.
+Chroma is initialized via:
+
+```python
+from langchain_chroma import Chroma
+
+vector_store = Chroma(
+    collection_name="financial_knowledge",
+    embedding_function=embeddings,  # HuggingFaceEmbeddings("BAAI/bge-small-zh-v1.5")
+    persist_directory="./backend/chroma_db",
+)
+```
+
+The collection is **created on first use** if it does not already exist — no manual
+setup required. Chroma data persists across restarts — no need to re-ingest
+documents on every startup.
 
 ---
 
@@ -863,7 +1097,7 @@ Parse (extract text based on file type)
     ↓
 Chunk (split text into overlapping chunks)
     ↓
-Embed (BAAI/bge-small-en-v1.5, local model)
+Embed (BAAI/bge-small-zh-v1.5, local model)
     ↓
 Chroma Storage (persist to disk)
     ↓
@@ -892,10 +1126,22 @@ Use LangChain's `RecursiveCharacterTextSplitter`.
 ## 12.4 Embedding Model
 
 ```text
-BAAI/bge-small-en-v1.5
+BAAI/bge-small-zh-v1.5
 ```
 
-Local model loaded via `sentence-transformers` or `langchain_community.embeddings.HuggingFaceEmbeddings`.
+Chinese-optimized local model (24M params, 512 dimensions) loaded via
+`langchain_huggingface.HuggingFaceEmbeddings` with query instruction:
+`"为这个句子生成表示以用于检索相关文章："`
+
+```python
+from langchain_huggingface import HuggingFaceEmbeddings
+
+embeddings = HuggingFaceEmbeddings(
+    model_name="BAAI/bge-small-zh-v1.5",
+    model_kwargs={"device": "cpu"},
+    encode_kwargs={"normalize_embeddings": True},
+)
+```
 
 ---
 
@@ -953,6 +1199,34 @@ Every chunk stored in Chroma must include:
 
 ---
 
+## 12.8 Knowledge Base Auto-Ingestion on Startup
+
+On first startup (or when `knowledge_base/` directory has files not yet ingested),
+the system automatically ingests all supported files:
+
+```text
+On FastAPI startup event:
+    ↓
+Scan knowledge_base/ for .pdf, .md, .txt files
+    ↓
+For each file not already tracked in knowledge_documents table:
+    ├── Parse text from file
+    ├── Chunk (800 char chunks, 150 char overlap)
+    ├── Embed using BAAI/bge-small-zh-v1.5
+    ├── Store chunks in Chroma collection "financial_knowledge"
+    └── Create KnowledgeDocument record in SQLite
+    ↓
+Log ingestion summary (files processed, chunks created)
+```
+
+If `knowledge_base/` is empty or all files are already ingested, the startup is a no-op.
+
+This ensures the RAG system has pre-loaded knowledge documents available for retrieval
+without requiring manual uploads via the upload API. The upload API is still available
+for adding new documents at runtime.
+
+---
+
 # 13. Market Data Architecture
 
 ## 13.1 Market Data Source
@@ -1005,11 +1279,20 @@ No Redis or distributed cache will be used.
 
 ## 13.4 News Search
 
-Market queries automatically trigger news search via **Tavily Search**:
+Market queries automatically trigger news search via **Tavily Search** (official `langchain-tavily` package):
 
-- Search for "[TICKER] stock news today"
+```python
+from langchain_tavily import TavilySearch
+
+search_tool = TavilySearch(
+    max_results=5,
+    tavily_api_key=settings.tavily_api_key,
+)
+```
+
+- Search for "[TICKER] stock news" for each ticker
 - Return top 5 results with URLs and snippets
-- Optionally extract full content via **Tavily Extract** for key articles
+- Extract full content via **Tavily Extract** (`langchain-tavily` `TavilyExtract`) for top 2 articles per ticker
 
 ---
 
@@ -1023,12 +1306,14 @@ The `/api/chat` endpoint supports two modes via `stream` parameter:
   workflow executes, and results are delivered incrementally via SSE events. Used by the
   frontend for real-time UX.
 
-- **Non-Streaming (`stream=False`):** Returns `application/json`. The full LangGraph
-  workflow executes identically, but results are collected and returned as a single
-  `ChatResponse` JSON object after graph completion. Used for testing and programmatic
-  API consumption.
+- **Non-Streaming (`stream=False`):** Returns `application/json`. Uses a simpler path:
+  the graph executes via `compiled_graph.ainvoke()` directly (no `_token_queue`, no
+  SSE), and the final state is serialized as `ChatResponse`. Used for testing and
+  programmatic API consumption.
 
-Both modes execute the same graph logic — only the delivery mechanism differs.
+Both modes execute the SAME graph nodes — only the delivery mechanism differs.
+Non-streaming skips the SSE infrastructure entirely; streaming adds the dual-track
+queue layer on top.
 
 ---
 
@@ -1062,8 +1347,9 @@ All APIs must:
 |---|---|---|
 | POST | `/api/chat` | send message, returns SSE stream or JSON |
 | GET | `/api/sessions` | list all sessions |
-| POST | `/api/sessions` | create new session (auto-generates title later) |
+| POST | `/api/sessions` | create new session (title defaults to "新对话") |
 | GET | `/api/sessions/{id}` | load session detail + messages |
+| PATCH | `/api/sessions/{id}/title` | update session title (used after async title generation) |
 | DELETE | `/api/sessions/{id}` | delete session + all messages |
 | POST | `/api/rag/upload` | upload document for ingestion |
 | GET | `/api/health` | system health check |
@@ -1091,14 +1377,36 @@ Frontend consumes via `fetch` + `ReadableStream` (NOT `EventSource`):
 
 ## 15.2 SSE Event Types
 
+### Status Event (sent when a graph node starts executing)
+
+```text
+event: status
+data: {"node": "market_data", "status": "running"}
+```
+
+Frontend uses this to show a tool execution indicator (e.g., "Fetching market data...").
+Each graph node emits a status event when it begins work. The frontend clears the
+indicator when `token` events start arriving (generation has begun).
+
+Node names sent via status events:
+- `market_data` → "Fetching market data..."
+- `news` → "Searching latest news..."
+- `extract` → "Extracting article content..."
+- `retrieval` → "Searching knowledge base..."
+- `rerank` → "Selecting most relevant information..."
+- `merge` → "Synthesizing context..."
+- `generation` → "Generating response..." (briefly shown before first token arrives)
+
+---
+
 ### Token Event
 
 ```text
 event: token
-data: {"content": "Tesla"}
+data: {"content": "特斯拉"}
 
 event: token
-data: {"content": " stock"}
+data: {"content": "当前"}
 ```
 
 ---
@@ -1240,6 +1548,7 @@ Zustand stores ONLY UI state:
 - `activeSessionId: string | null`
 - `sidebarOpen: boolean`
 - `streamingTokens: string` (accumulated during SSE streaming)
+- `statusMessage: string | null` (current tool execution status, cleared on first token)
 - `isStreaming: boolean`
 - `theme: "light" | "dark" | "system"`
 
@@ -1265,7 +1574,11 @@ Zustand: isStreaming = true, streamingTokens = ""
     ↓
 POST /api/chat with fetch + ReadableStream
     ↓
-Each "token" SSE event: Zustand appends to streamingTokens
+"status" SSE event: Zustand sets statusMessage (e.g., "Fetching market data...")
+    ↓ (repeated for each node: market_data → news → extract → retrieval → rerank → etc.)
+    ↓
+"token" SSE event: Zustand clears statusMessage, appends to streamingTokens
+    ↓ (subsequent token events just append)
     ↓
 "structured_data" event: Zustand stores for market panel
     ↓
@@ -1363,25 +1676,30 @@ After the first user query in a new session:
 ```text
 1. Persist user message + assistant response
 2. Fire-and-forget via FastAPI BackgroundTasks:
-   LLM (MiniMax-M2.7) with prompt:
-   "Generate a short title (max 5 words) for this conversation.
-    Query: {user_query}
-    Response summary: {response_summary}"
-3. Update session title in SQLite
-4. Frontend refetches session list to show new title
+   LLM (MiniMax-M2.7) with Chinese prompt:
+   "根据以下对话，生成一个简短的标题（不超过15个中文字）：
+    用户问题：{user_query}
+    助手回答摘要：{response_summary}"
+3. PATCH /api/sessions/{id}/title to update session title in SQLite
+4. Frontend observes title update via TanStack Query cache invalidation
 ```
 
 Title generation is a fire-and-forget background task — the user's chat response
-is never delayed by title generation. The frontend observes title updates via
-TanStack Query cache invalidation.
+is never delayed by title generation. If title generation fails, the title
+remains permanently as "新对话" (no retry mechanism). The user can manually
+rename via PATCH if desired.
 
-Example titles:
+The `{response_summary}` is the first ~200 characters of the assistant's response
+(truncated, not a separate LLM call) — sufficient for the LLM to understand the topic.
+
+Example titles (all Chinese):
 
 ```text
-"Tesla Stock Analysis"
-"PE Ratio Explanation"
-"NVIDIA Market Trends 2026"
+"特斯拉股价分析"
+"市盈率概念解释"
+"NVIDIA 2026年市场走势"
 ```
+
 
 ---
 
@@ -1421,7 +1739,7 @@ Responsibilities:
 | Python | 3.11+ |
 | Node.js | 20 LTS+ |
 | npm | 10+ |
-| OS | Windows / macOS / Linux |
+| OS | Windows |
 
 ### CORS Configuration
 
@@ -1579,116 +1897,127 @@ financial-asset-qa-system/
 
 ## 26.1 Backend Structure
 
+The backend uses an `app/` package for clean imports:
+
+```python
+from app.api.routes import chat
+from app.graph.builder import create_graph
+from app.config.settings import settings
+```
+
 ```text
 backend/
-├── api/
-│   ├── routes/
-│   │   ├── chat.py              # POST /api/chat (SSE streaming)
-│   │   ├── sessions.py          # Session CRUD endpoints
-│   │   ├── rag.py               # POST /api/rag/upload
-│   │   └── health.py            # GET /api/health
-│   │
-│   ├── schemas/
-│   │   ├── chat.py              # ChatRequest, ChatResponse
-│   │   ├── session.py           # SessionResponse, SessionDetailResponse
-│   │   ├── rag.py               # UploadResponse
-│   │   └── common.py            # ErrorResponse, HealthResponse
-│   │
-│   └── dependencies.py          # Depends() for DB session, LLM provider, config
-
-├── graph/
-│   ├── builder.py               # Create, register nodes/edges, compile graph
-│   ├── state.py                 # GraphState TypedDict
-│   ├── intent_classifier.py     # LLM-based intent classification
-│   ├── nodes/
-│   │   ├── intent_node.py       # Classify intent, set state.intent
-│   │   ├── market_node.py       # Fetch Yahoo Finance data, set state.market_data
-│   │   ├── news_node.py         # Tavily search, set state.news_data
-│   │   ├── extract_node.py      # Tavily Extract full article text
-│   │   ├── retrieval_node.py    # Chroma similarity search
-│   │   ├── rerank_node.py       # LLM rerank top-k chunks
-│   │   ├── merge_node.py        # LLM synthesize market + news + RAG context (hybrid only)
-│   │   ├── generation_node.py   # LLM response generation
-│   │   ├── formatter_node.py    # Normalize structured_data + citations
-│   │   └── rejection_node.py    # Friendly rejection for unsupported queries
-│   │
-│   └── edges/
-│       ├── router.py            # Conditional edge: intent → next node
-│       └── conditions.py        # Edge condition functions
-
-├── tools/
-│   ├── market_data_tool.py      # Yahoo Finance via yfinance
-│   ├── tavily_search_tool.py    # Tavily Search API
-│   ├── tavily_extract_tool.py   # Tavily Extract API
-│   ├── retrieval_tool.py        # Chroma vector search
-│   ├── rerank_tool.py           # LLM-based rerank
-│   ├── embedding_tool.py        # BAAI/bge-small-en-v1.5 embeddings
-│   └── llm_tool.py              # LLM provider factory + with_structured_output helper
-
-├── repositories/
-│   ├── session_repository.py
-│   ├── message_repository.py
-│   ├── document_repository.py
-│   └── ingestion_repository.py
-
-├── services/
-│   ├── session_service.py       # Session lifecycle + title generation
-│   ├── rag_service.py           # Document parsing, chunking, ingestion orchestration
-│   ├── streaming_service.py     # SSE event formatting + lifecycle
-│   └── title_generation_service.py  # Async LLM title generation
-
-├── database/
-│   ├── base.py                  # SQLAlchemy Base
-│   ├── models/
-│   │   ├── chat_session.py
-│   │   ├── chat_message.py
-│   │   ├── knowledge_document.py
-│   │   └── ingestion_job.py
-│   ├── session.py               # get_db session factory
-│   └── engine.py                # SQLAlchemy engine + connection
-
-├── vectorstore/
-│   ├── chroma_client.py         # Chroma client init (persist mode)
-│   └── collections.py           # Collection management + CRUD
-
-├── prompts/
-│   ├── system/
-│   │   └── system_prompt.txt    # Main system prompt
-│   ├── market/
-│   │   ├── market_analysis.txt  # Market analysis prompt template
-│   │   └── market_structured.txt
-│   ├── rag/
-│   │   ├── rag_generation.txt   # RAG-grounded generation prompt
-│   │   └── rag_rerank.txt       # Rerank selection prompt
-│   ├── rerank/
-│   │   └── rerank_selection.txt
-│   ├── formatting/
-│   │   └── structured_format.txt
-│   ├── intent/
-│   │   └── intent_classifier.txt # Intent classification prompt
-│   ├── rejection/
-│   │   └── unsupported_query.txt # Friendly rejection prompt
-│   └── title/
-│       └── title_generation.txt  # Session title generation prompt
-
-├── providers/
-│   ├── base_provider.py         # BaseLLMProvider abstract class
-│   ├── openai_provider.py       # OpenAI-compatible provider (covers MiniMax)
-│   └── mock_provider.py         # Mock provider for testing without real API keys
-
-├── utils/
-│   ├── logger.py                # Structured logging setup
-│   ├── markdown.py              # Markdown utilities (if needed server-side)
-│   ├── token_counter.py         # Token counting utilities
-│   ├── time.py                  # UTC timestamp helpers
-│   └── errors.py                # Custom exception classes
-
-├── config/
-│   ├── settings.py              # Pydantic Settings (reads .env)
-│   └── constants.py             # Non-configurable constants
-
-├── main.py                      # FastAPI app creation, router registration, startup
-└── requirements.txt
+├── app/
+│   ├── api/
+│   │   ├── routes/
+│   │   │   ├── chat.py              # POST /api/chat (SSE streaming)
+│   │   │   ├── sessions.py          # Session CRUD + PATCH title
+│   │   │   ├── rag.py               # POST /api/rag/upload
+│   │   │   └── health.py            # GET /api/health
+│   │   │
+│   │   ├── schemas/
+│   │   │   ├── chat.py              # ChatRequest, ChatResponse
+│   │   │   ├── session.py           # SessionResponse, SessionDetailResponse
+│   │   │   ├── rag.py               # UploadResponse
+│   │   │   └── common.py            # ErrorResponse, HealthResponse
+│   │   │
+│   │   └── dependencies.py          # Depends() for DB session, LLM provider, config
+│
+│   ├── graph/
+│   │   ├── builder.py               # Create, register nodes/edges, compile graph
+│   │   ├── state.py                 # GraphState TypedDict
+│   │   ├── intent_classifier.py     # LLM-based intent classification
+│   │   ├── nodes/
+│   │   │   ├── intent_node.py       # Classify intent, set state.intent
+│   │   │   ├── market_node.py       # Fetch Yahoo Finance data, set state.market_data
+│   │   │   ├── news_node.py         # Tavily search, set state.news_data
+│   │   │   ├── extract_node.py      # Tavily Extract full article text
+│   │   │   ├── retrieval_node.py    # Chroma similarity search
+│   │   │   ├── rerank_node.py       # LLM rerank top-k chunks
+│   │   │   ├── merge_node.py        # LLM synthesize market + news + RAG context (hybrid only)
+│   │   │   ├── generation_node.py   # LLM response generation + token streaming
+│   │   │   ├── formatter_node.py    # Normalize structured_data + citations
+│   │   │   └── rejection_node.py    # Friendly rejection for unsupported queries
+│   │   │
+│   │   └── edges/
+│   │       ├── router.py            # Conditional edge: intent → next node
+│   │       └── conditions.py        # Edge condition functions
+│
+│   ├── tools/
+│   │   ├── market_data_tool.py      # Yahoo Finance via yfinance
+│   │   ├── tavily_search_tool.py    # Tavily Search via langchain-tavily TavilySearch
+│   │   ├── tavily_extract_tool.py   # Tavily Extract via langchain-tavily TavilyExtract
+│   │   ├── retrieval_tool.py        # Chroma vector search via langchain-chroma
+│   │   ├── rerank_tool.py           # LLM-based rerank
+│   │   ├── embedding_tool.py        # BAAI/bge-small via langchain-huggingface
+│   │   └── llm_tool.py              # LLM provider factory (ChatOpenAI for MiniMax)
+│
+│   ├── repositories/
+│   │   ├── session_repository.py
+│   │   ├── message_repository.py
+│   │   ├── document_repository.py
+│   │   └── ingestion_repository.py
+│
+│   ├── services/
+│   │   ├── session_service.py       # Session lifecycle + title generation
+│   │   ├── rag_service.py           # Document parsing, chunking, ingestion orchestration
+│   │   ├── streaming_service.py     # SSE event formatting + lifecycle
+│   │   └── title_generation_service.py  # Async LLM title generation
+│
+│   ├── database/
+│   │   ├── base.py                  # SQLAlchemy Base
+│   │   ├── models/
+│   │   │   ├── chat_session.py
+│   │   │   ├── chat_message.py
+│   │   │   ├── knowledge_document.py
+│   │   │   └── ingestion_job.py
+│   │   ├── session.py               # get_db session factory
+│   │   └── engine.py                # SQLAlchemy engine + connection
+│
+│   ├── vectorstore/
+│   │   ├── chroma_client.py         # Chroma client init via langchain-chroma (persist mode)
+│   │   └── collections.py           # Collection management + CRUD
+│
+│   ├── prompts/
+│   │   ├── system/
+│   │   │   └── system_prompt.txt    # Main system prompt (Chinese)
+│   │   ├── market/
+│   │   │   ├── market_analysis.txt  # Market analysis prompt template (Chinese)
+│   │   │   └── market_structured.txt
+│   │   ├── rag/
+│   │   │   ├── rag_generation.txt   # RAG-grounded generation prompt (Chinese)
+│   │   │   └── rag_rerank.txt       # Rerank selection prompt (Chinese)
+│   │   ├── rerank/
+│   │   │   └── rerank_selection.txt
+│   │   ├── formatting/
+│   │   │   └── structured_format.txt
+│   │   ├── intent/
+│   │   │   └── intent_classifier.txt # Intent classification prompt (Chinese)
+│   │   ├── rejection/
+│   │   │   └── unsupported_query.txt # Friendly rejection prompt (Chinese)
+│   │   └── title/
+│   │       └── title_generation.txt  # Session title generation prompt (Chinese)
+│
+│   ├── providers/
+│   │   ├── base_provider.py         # BaseLLMProvider abstract class
+│   │   ├── openai_provider.py       # OpenAI-compatible provider (ChatOpenAI with MiniMax base_url)
+│   │   └── mock_provider.py         # Mock provider for testing without real API keys
+│
+│   ├── utils/
+│   │   ├── logger.py                # Structured logging setup
+│   │   ├── markdown.py              # Markdown utilities (if needed server-side)
+│   │   ├── token_counter.py         # Token counting utilities
+│   │   ├── time.py                  # UTC timestamp helpers
+│   │   └── errors.py                # Custom exception classes
+│
+│   ├── config/
+│   │   ├── settings.py              # Pydantic Settings (reads .env from project root)
+│   │   └── constants.py             # Non-configurable constants
+│
+│   └── main.py                      # FastAPI app creation, router registration, startup
+│
+├── requirements.txt
+└── data/                            # SQLite DB created here at runtime
 ```
 
 ---
@@ -1797,8 +2126,33 @@ frontend/
 ├── package.json
 ├── tailwind.config.ts
 ├── tsconfig.json
-└── next.config.ts
+└── next.config.ts                    # Includes rewrites() for API proxy
 ```
+
+### 27.2 Next.js API Proxy
+
+The frontend uses Next.js `rewrites()` to proxy `/api/*` to the backend at `http://localhost:8000`:
+
+```typescript
+// next.config.ts
+import type { NextConfig } from "next";
+
+const nextConfig: NextConfig = {
+  async rewrites() {
+    return [
+      {
+        source: "/api/:path*",
+        destination: "http://localhost:8000/api/:path*",
+      },
+    ];
+  },
+};
+
+export default nextConfig;
+```
+
+This allows frontend code to call `/api/chat` (relative path) without CORS issues
+or hardcoded backend URLs. The proxy is transparent to the browser.
 
 ---
 
@@ -1872,7 +2226,7 @@ Response:
 ```python
 class SessionResponse(BaseModel):
     id: str              # UUID4
-    title: str           # default "New Chat" until first query
+    title: str           # default "新对话" until first query
     created_at: str      # UTC ISO 8601
     updated_at: str      # UTC ISO 8601
 ```
@@ -1905,13 +2259,32 @@ class SessionDetailResponse(BaseModel):
 
 ---
 
-## 30.4 Delete Session
+## 30.4 Update Session Title
+
+```http
+PATCH /api/sessions/{session_id}/title
+Content-Type: application/json
+```
+
+Request body:
+
+```json
+{"title": "特斯拉股价分析"}
+```
+
+Used by the backend after async LLM title generation completes. The title is updated
+in SQLite, and the frontend observes the change via TanStack Query cache invalidation.
+
+---
+
+## 30.5 Delete Session
 
 ```http
 DELETE /api/sessions/{session_id}
 ```
 
-Returns `204 No Content` on success.
+Returns `204 No Content` on success. **Hard delete** — permanently removes the session
+and all its messages from SQLite (CASCADE). No soft delete, no recovery.
 
 ---
 
@@ -1994,7 +2367,7 @@ class ChatSession(Base):
     __tablename__ = "chat_sessions"
 
     id = Column(String, primary_key=True)            # UUID4
-    title = Column(String, nullable=False, default="New Chat")
+    title = Column(String, nullable=False, default="新对话")
     created_at = Column(String, nullable=False)      # UTC ISO 8601
     updated_at = Column(String, nullable=False)      # UTC ISO 8601
 ```
@@ -2057,7 +2430,12 @@ Responsible for:
 - creating StateGraph
 - registering all nodes
 - registering conditional edges
-- compiling graph
+- compiling graph with `checkpointer=False` (session persistence is handled by SQLite,
+  not by LangGraph checkpointing)
+
+```python
+compiled_graph = workflow.compile(checkpointer=False)
+```
 
 ---
 
@@ -2203,8 +2581,6 @@ from typing import Literal
 
 class IntentResult(BaseModel):
     intent: Literal["market", "rag", "hybrid", "unsupported"]
-    confidence: float
-    reasoning: str
 
 async def classify_intent(
     query: str,
@@ -2224,14 +2600,14 @@ async def classify_intent(
 
 | Intent | Example Query |
 |---|---|
-| market | "What is Tesla's current stock price?" |
-| market | "Show me AAPL's market cap and PE ratio" |
-| rag | "What is PE ratio?" |
-| rag | "Explain discounted cash flow valuation" |
-| hybrid | "Why did Tesla stock fall recently and what does its PE ratio imply?" |
-| hybrid | "NVIDIA's valuation seems high — explain using its current PE" |
-| unsupported | "Write me a poem about the stock market" |
-| unsupported | "Tell me a joke" |
+| market | "特斯拉当前股价是多少？" |
+| market | "显示苹果的市值和市盈率" |
+| rag | "什么是市盈率？" |
+| rag | "解释现金流折现估值法" |
+| hybrid | "为什么特斯拉股价下跌？市盈率能说明什么？" |
+| hybrid | "英伟达估值似乎很高——根据其当前市盈率解释" |
+| unsupported | "写一首关于股市的诗" |
+| unsupported | "给我讲个笑话" |
 
 ---
 
@@ -2242,16 +2618,50 @@ async def classify_intent(
 File: `tools/market_data_tool.py`
 
 Responsibilities:
+- **Ticker extraction**: LLM function_calling extracts ticker symbols from user query
+  (separate from intent classification — dedicated LLM call inside market_node)
 - fetch real-time stock price via `yfinance.Ticker(symbol).info`
 - fetch historical data via `yfinance.Ticker(symbol).history(period="30d")`
 - normalize output to standard dict format
 - cache results with `TTLCache(maxsize=128, ttl=60)`
+- for multi-asset queries: fetch all tickers in **parallel** via `asyncio.gather`
 
-Typed interface:
+Typed interfaces:
 
 ```python
+class TickerList(BaseModel):
+    tickers: list[str]
+
+async def extract_tickers(query: str, model) -> list[str]:
+    """Extract ticker symbols from query via LLM function_calling."""
+
 async def fetch_market_data(symbol: str) -> dict:
-    """Returns normalized market data or raises MarketDataError."""
+    """Returns normalized market data or raises MarketDataError.
+    Wraps sync yfinance calls with asyncio.to_thread()."""
+
+async def fetch_all_market_data(tickers: list[str]) -> dict[str, dict]:
+    """Fetch data for multiple tickers in parallel via asyncio.gather.
+    Returns dict keyed by ticker symbol. Caches per-ticker results."""
+```
+
+Normalized output per ticker:
+```python
+{
+    "symbol": "TSLA",
+    "price": 221.13,
+    "change": 5.20,
+    "change_pct": 2.4,
+    "trend": "bullish",         # derived from change sign
+    "market_metrics": {
+        "market_cap": "692.5B",
+        "pe_ratio": 62.3,
+        "volume": "58.2M"
+    },
+    "chart_data": {
+        "7d": [{"date": "...", "close": ...}, ...],
+        "30d": [{"date": "...", "close": ...}, ...]
+    }
+}
 ```
 
 ---
@@ -2259,6 +2669,20 @@ async def fetch_market_data(symbol: str) -> dict:
 ## 36.2 Tavily Search Tool
 
 File: `tools/tavily_search_tool.py`
+
+Uses the official `langchain-tavily` package (NOT the deprecated `langchain_community` version):
+
+```python
+from langchain_tavily import TavilySearch
+
+def create_tavily_search_tool(api_key: str) -> TavilySearch:
+    return TavilySearch(
+        max_results=5,
+        tavily_api_key=api_key,
+    )
+```
+
+Install: `pip install langchain-tavily`
 
 Responsibilities:
 - search financial news: query = f"{ticker} stock news"
@@ -2271,13 +2695,28 @@ Responsibilities:
 
 File: `tools/tavily_extract_tool.py`
 
+Uses the official `langchain-tavily` package (NOT the deprecated `langchain_community` version):
+
+```python
+from langchain_tavily import TavilyExtract
+
+def create_tavily_extract_tool(api_key: str) -> TavilyExtract:
+    return TavilyExtract(
+        tavily_api_key=api_key,
+        extract_depth="advanced",
+        format="markdown",
+    )
+```
+
+Install: `pip install langchain-tavily`
+
 Corresponding graph node: `graph/nodes/extract_node.py`
 
 Responsibilities:
-- take top 2 URLs from `state["news_data"]`
-- extract full article text from each URL via Tavily Extract API
-- return list of cleaned text content with source URL
-- store results in `state["extracted_articles"]`
+- take top 2 URLs **per ticker** from `state["news_data"]`
+- extract full article text from each URL via Tavily Extract
+- merge all extracted content and store in `state["extracted_articles"]`
+- all extracted articles are sent to the LLM as context
 
 This is a dedicated LangGraph node (not embedded in the news node), placed after
 the news node in market and hybrid flows.
@@ -2289,7 +2728,7 @@ the news node in market and hybrid flows.
 File: `tools/retrieval_tool.py`
 
 Responsibilities:
-- embed user query using BAAI/bge-small-en-v1.5
+- embed user query using BAAI/bge-small-zh-v1.5
 - similarity search in Chroma (top-k=8)
 - return chunks with metadata (document_id, document_name, chunk_index)
 
@@ -2314,9 +2753,25 @@ Rerank prompt approach: present all 8 chunks with IDs, ask LLM to select the 4 m
 File: `tools/embedding_tool.py`
 
 Responsibilities:
-- load BAAI/bge-small-en-v1.5 model (lazy, once)
+- load BAAI/bge-small-zh-v1.5 model (lazy, once, 24M params, 512 dims)
 - embed single text or batch
 - return normalized embedding vectors
+
+```python
+from langchain_huggingface import HuggingFaceEmbeddings
+
+_model: HuggingFaceEmbeddings | None = None
+
+def get_embedding_model() -> HuggingFaceEmbeddings:
+    global _model
+    if _model is None:
+        _model = HuggingFaceEmbeddings(
+            model_name="BAAI/bge-small-zh-v1.5",
+            model_kwargs={"device": "cpu"},
+            encode_kwargs={"normalize_embeddings": True},
+        )
+    return _model
+```
 
 ---
 
@@ -2407,26 +2862,31 @@ prompts/
 
 ## 38.2 Prompt File Format
 
-All prompts stored as `.txt` files with optional `{placeholder}` template variables.
+All prompts stored as `.txt` files with `{placeholder}` template variables.
+**All prompts are written in Chinese** for optimal LLM performance with
+Chinese-language user interactions and knowledge base content.
 
 Example `prompts/intent/intent_classifier.txt`:
 
 ```text
-You are an intent classifier for a financial QA system.
-Classify the user's query into one of four categories:
+你是一个金融问答系统的意图分类器。
+请将用户的查询精确分类到以下四个类别之一：
 
-- market: queries about stock prices, market data, specific asset metrics
-- rag: queries about financial concepts, definitions, terminology, theory
-- hybrid: queries that combine market data questions with financial concept questions
-- unsupported: queries completely unrelated to finance or investing
+- market：关于股票价格、市场数据、具体资产指标的查询
+- rag：关于金融概念、定义、术语、理论的查询
+- hybrid：同时涉及市场数据和金融概念的复合查询
+- unsupported：与金融或投资完全无关的查询
 
-Examples:
-- "What is Tesla's stock price?" → market
-- "What is PE ratio?" → rag
-- "Why did Tesla stock fall and what does PE ratio mean?" → hybrid
-- "Write me a poem" → unsupported
+示例：
+- "特斯拉当前股价是多少？" → market
+- "什么是市盈率？" → rag
+- "为什么特斯拉股价下跌？市盈率能说明什么？" → hybrid
+- "写一首关于股票的诗" → unsupported
 
-User query: {user_query}
+特殊规则：如果用户只输入了一个股票代码（如"TSLA"、"AAPL"），应归类为 market。
+如果用户只输入了一个简短术语（如"PE"、"市盈率"），应归类为 rag。
+
+用户查询：{user_query}
 ```
 
 Prompt files are loaded at startup/import time via a simple `load_prompt(path)` utility that reads the file contents.
@@ -2449,12 +2909,13 @@ Reasoning:
 
 ## 39.1 System Prompt Goals
 
-The assistant must:
-- separate facts from analysis
+The system prompt is written in **Chinese**. The assistant must:
+- separate facts from analysis (事实 ≠ 分析)
 - avoid hallucination (cite sources or acknowledge uncertainty)
-- cite sources for all data claims
-- avoid price prediction (no "will go up/down")
+- cite sources for all data claims (所有数据声明必须引用来源)
+- avoid price prediction (no "will go up/down", 禁止预测涨跌)
 - acknowledge uncertainty when data is incomplete
+- respond in Chinese, matching the user's language
 
 ---
 
@@ -2463,21 +2924,22 @@ The assistant must:
 The system prompt must explicitly enforce:
 
 ```text
-objective market data ≠ analytical interpretation
+客观市场数据 ≠ 分析解读
 ```
 
-Market data is presented as-is. Any interpretation must be clearly labeled as analysis.
+Market data is presented as-is. Any interpretation must be clearly labeled as analysis
+（分析仅代表基于数据的推断，不构成投资建议）.
 
 ---
 
 ## 39.3 Forbidden Behaviors
 
 The assistant must NOT:
-- fabricate market prices
-- predict future stock movements
-- invent citations or sources
-- claim unsupported financial conclusions
-- give investment advice
+- fabricate market prices (编造市场数据)
+- predict future stock movements (预测未来股价走势)
+- invent citations or sources (伪造引用来源)
+- claim unsupported financial conclusions (做出无数据支持的结论)
+- give investment advice (提供投资建议)
 
 ---
 
@@ -2583,7 +3045,8 @@ Multi-asset queries produce a list with one entry per ticker.
 
 ## 42.2 Structured Data Implementation
 
-Structured data is extracted from LLM output via `with_structured_output`:
+Structured data is built by the **formatter_node** from real Yahoo Finance data — NOT extracted from LLM output.
+The LLM only extracts citations.
 
 ```python
 class AssetData(BaseModel):
@@ -2597,16 +3060,18 @@ class AssetData(BaseModel):
 
 class StructuredData(BaseModel):
     assets: list[AssetData]
-
-structured_llm = model.with_structured_output(
-    StructuredData,
-    method="function_calling",
-)
 ```
 
-The backend fills `chart_data` with actual Yahoo Finance historical data
-(not LLM-generated). The LLM extracts symbol, price, change, trend, and metrics;
-the chart data is injected by the formatter node from `state.market_data`.
+The formatter_node populates every field of `AssetData` from `state["market_data"]`:
+- `symbol` → from ticker
+- `price` → yfinance `info["currentPrice"]` or `history["Close"][-1]`
+- `change` → `info["regularMarketChange"]`
+- `change_pct` → `info["regularMarketChangePercent"]`
+- `trend` → derived: "bullish" if change > 0, "bearish" if < 0, "neutral" if 0
+- `market_metrics` → `{"market_cap": ..., "pe_ratio": ..., "volume": ...}` from yfinance info
+- `chart_data` → built from yfinance `history(period="30d")` (7d and 30d arrays)
+
+For multi-asset queries, `assets` contains one entry per ticker.
 
 ---
 
@@ -2946,7 +3411,7 @@ Frontend displays errors via:
 The system must log:
 
 - incoming requests (method, path, session_id)
-- graph routing (intent: {intent}, confidence: {confidence})
+- graph routing (intent: {intent})
 - node execution (node: {name}, duration_ms)
 - retrieval latency (k: {k}, duration_ms)
 - market API latency (symbol: {symbol}, duration_ms)
@@ -2958,7 +3423,7 @@ The system must log:
 ## 51.2 Log Format
 
 ```text
-[2026-05-12T10:30:00] [INFO] [graph.router] Intent classified: market (confidence=0.95)
+[2026-05-12T10:30:00] [INFO] [graph.router] Intent classified: market
 [2026-05-12T10:30:02] [INFO] [tools.market] Fetched market data for TSLA in 1200ms
 [2026-05-12T10:30:05] [ERROR] [api.chat] SSE stream terminated: MarketAPIError - ...
 ```
@@ -2969,7 +3434,25 @@ The system must log:
 
 ## 52.1 Environment Variables
 
-```text
+Two `.env` files serve different purposes:
+
+| File | Purpose |
+|---|---|
+| `docs/.env` | Development configuration with **real API keys** (used during implementation) |
+| `.env` (project root) | Template/symlink for runtime — loaded by Pydantic `BaseSettings` |
+| `.env.example` (project root) | Safe-to-commit template without secrets |
+
+The backend reads from project root `.env` at runtime via:
+```python
+class Settings(BaseSettings):
+    ...
+    class Config:
+        env_file = ".env"  # relative to CWD (project root)
+```
+
+For local development, the developer copies `docs/.env` to project root or uses a symlink.
+
+```
 # .env file at project root
 
 # LLM Provider (MiniMax by default)
@@ -2985,7 +3468,7 @@ SQLITE_PATH=./backend/data/sqlite.db
 CHROMA_PATH=./backend/chroma_db/
 
 # Embedding model (optional)
-EMBEDDING_MODEL=BAAI/bge-small-en-v1.5
+EMBEDDING_MODEL=BAAI/bge-small-zh-v1.5
 ```
 
 ---
@@ -3004,13 +3487,24 @@ class Settings(BaseSettings):
     tavily_api_key: str
     sqlite_path: str = "./backend/data/sqlite.db"
     chroma_path: str = "./backend/chroma_db/"
-    embedding_model: str = "BAAI/bge-small-en-v1.5"
+    embedding_model: str = "BAAI/bge-small-zh-v1.5"
 
     class Config:
         env_file = ".env"
 
 settings = Settings()
 ```
+
+### Startup Validation
+
+On FastAPI startup, the system validates that required API keys are present:
+
+- If `MINIMAX_API_KEY` is missing or empty → **fail with clear error message** (no mock fallback)
+- If `TAVILY_API_KEY` is missing or empty → **fail with clear error message**
+- The error tells the user exactly which env var is missing
+
+This matches the fail-fast philosophy: no silent degradation, no MockProvider auto-switch.
+The MockProvider is only used explicitly in unit tests.
 
 ---
 
@@ -3686,7 +4180,7 @@ Parse file:
     ↓
 Chunk: RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=150)
     ↓
-Embed: BAAI/bge-small-en-v1.5 (HuggingFaceEmbeddings)
+Embed: BAAI/bge-small-zh-v1.5 (HuggingFaceEmbeddings)
     ↓
 Store in Chroma (persist mode)
     ↓
@@ -3737,7 +4231,7 @@ News-based reasoning must:
 ## 73.1 Session Lifecycle
 
 ```text
-Create (POST /api/sessions, title="New Chat")
+Create (POST /api/sessions, title="新对话")
     → First user query triggers title generation (async)
     → All messages persisted (user + assistant)
     → Reload (GET /api/sessions/{id} returns messages)
@@ -3805,6 +4299,12 @@ All errors use:
 GraphState.error stores: `{"type": "...", "message": "..."}` (dict, not string).
 
 Error types: `LLMError`, `MarketAPIError`, `TavilyError`, `RetrievalError`, `ValidationError`, `InternalError`.
+
+**Streaming mode**: errors are sent as SSE `error` events, which immediately terminate the stream.
+Frontend displays a toast + inline error with retry button.
+
+**Non-streaming mode**: errors are returned as JSON `{"error": {"type": "...", "message": "..."}}`
+with appropriate HTTP status codes (400/500).
 
 ---
 
@@ -4033,6 +4533,26 @@ Frontend must demonstrate:
 - market visualization (price, chart, metrics)
 - dark mode support
 
+### 82.3.1 Initial Load State
+
+On first page load (no active session):
+- Sidebar: visible, shows session list (may be empty). "新对话" button at top.
+- Chat area: empty state — no messages, no input box. Display a hint:
+  "选择一个对话或创建新对话开始"
+- Market panel: empty state — "暂无活跃资产" / "提出市场相关问题以查看数据"
+
+After user clicks "新对话" or selects an existing session:
+- Sidebar: selected session highlighted
+- Chat area: shows all messages for the session (empty if new), input box appears
+- Market panel: empty (updates when SSE `structured_data` event arrives)
+
+### 82.3.2 Session Switching
+
+When user clicks a different session in the sidebar:
+- Chat area transitions to new session's messages
+- Market panel clears (resets to empty state)
+- No additional API call to backend (messages already loaded via TanStack Query)
+
 ---
 
 # 83. Non-Goals
@@ -4075,21 +4595,33 @@ The project intentionally excludes:
 ```text
 Frontend:
 Next.js 15 + TypeScript + TailwindCSS + shadcn/ui + next-themes
+API Proxy: Next.js rewrites (localhost:8000)
 
 Backend:
 FastAPI + LangGraph (LangChain) + SQLAlchemy + Pydantic v2
+Package: backend/app/ (app package for clean imports)
 
 Databases:
-SQLite (relational) + Chroma (vector, persist mode)
+SQLite (relational, via SQLAlchemy) + Chroma (vector, via langchain-chroma, persist mode)
 
 RAG:
-BAAI/bge-small-en-v1.5 embeddings + Chroma retrieval + LLM rerank
+langchain-huggingface (BAAI/bge-small-zh-v1.5) + langchain-chroma retrieval
++ langchain-text-splitters (RecursiveCharacterTextSplitter) + LLM rerank
+Document loading: langchain-community PyPDFLoader (PDF) + raw text (.md, .txt)
+
+Web Search:
+langchain-tavily (TavilySearch + TavilyExtract)
 
 LLM:
-MiniMax-M2.7 (all tasks) — any OpenAI-compatible API via .env config
+MiniMax-M2.7 (all tasks) — OpenAI-compatible via ChatOpenAI with MiniMax base_url
 
 Streaming:
-Event-based SSE (fetch + ReadableStream on frontend)
+Dual-track SSE (text/event-stream): tokens streamed in real-time via asyncio.Queue
+while graph retains complete markdown for post-processing (formatter + structured extraction)
+Frontend: fetch + ReadableStream (NOT EventSource)
+
+Language:
+All UI, prompts, and generated responses in Simplified Chinese
 
 Testing:
 pytest + pytest-asyncio + httpx + Playwright
@@ -4154,30 +4686,43 @@ maintain consistency with the rest of the codebase.
 | Backend port | 8000 |
 | Frontend port | 3000 |
 | CORS origin (dev) | `http://localhost:3000` |
-| SQLite path | `./backend/data/sqlite.db` |
+| Frontend API proxy | Next.js rewrites: `/api/*` → `http://localhost:8000/api/*` |
+| SQLite path | `./backend/data/sqlite.db` (created at runtime) |
 | Chroma path | `./backend/chroma_db/` |
+| Chroma library | langchain-chroma (not raw chromadb) |
 | Chroma collection | `financial_knowledge` |
-| Knowledge base | `./knowledge_base/` (pre-loaded with Chinese docs) |
-| Documents pre-loaded | `pe_ratio.md`, `dcf_valuation.md`, `ebitda.md` |
+| Embedding library | langchain-huggingface (HuggingFaceEmbeddings) |
+| Knowledge base | `./knowledge_base/` (pre-loaded with 3 Chinese docs) |
+| Documents pre-loaded | `pe_ratio.md`, `dcf_valuation.md`, `ebitda.md` (all Chinese) |
 | Chunk size | 800 chars |
 | Chunk overlap | 150 chars |
 | Retrieval top-k | 8 |
 | Rerank top-n | 4 |
 | Market cache TTL | 60 seconds |
 | Cache max size | 128 entries |
-| Streaming method | SSE (text/event-stream) |
+| Streaming method | SSE (text/event-stream) via dual-track architecture |
 | Structured output | `with_structured_output(schema, method="function_calling")` |
-| Prompt format | `.txt` files with `{placeholder}` templates |
-| Default model | MiniMax-M2.7 |
+| Prompt format | `.txt` files with `{placeholder}` templates (Chinese) |
+| Default model | MiniMax-M2.7 (OpenAI-compatible at /v1/chat/completions) |
 | LLM env vars | `MINIMAX_API_KEY`, `MINIMAX_BASE_URL`, `MINIMAX_MODEL` |
-| LLM provider | OpenAI-compatible (configurable via .env) |
+| LLM provider | ChatOpenAI with MiniMax base_url (configurable via .env) |
+| Tavily Search | langchain-tavily TavilySearch |
+| Tavily Extract | langchain-community TavilyExtract |
 | Timestamp format | UTC ISO 8601 |
-| Error format | `{"error": {"type": "...", "message": "..."}}` |
+| Error format | SSE error event: `{"error": {"type": "...", "message": "..."}}` |
 | yfinance integration | `asyncio.to_thread()` wrapper for sync calls |
-| Title generation | FastAPI BackgroundTasks (fire-and-forget) |
-| Backend package root | `backend/` (no intermediate `app/` package) |
+| Title generation | FastAPI BackgroundTasks (fire-and-forget), LLM generates Chinese title ≤15 chars |
+| Title update endpoint | PATCH /api/sessions/{id}/title |
+| Default session title | "新对话" |
+| Backend package root | `backend/app/` (with `app/` package) |
 | Frontend source root | `frontend/src/` (Next.js 15 convention) |
-| User language | Simplified Chinese (all UI and knowledge docs) |
+| User language | Simplified Chinese (all UI, prompts, and generated responses) |
+| LangGraph checkpointer | disabled (False) — session state in SQLite |
+| Messages format | OpenAI: `[{"role": "user"|"assistant", "content": "..."}]` |
+| System prompt | dynamically prepended to messages (not stored in DB) |
+| Initial page state | no active session, chat area empty, input hidden |
+| PDF parsing | PyPDFLoader (langchain_community) |
+| Graph execution | `compile(checkpointer=False)` + dual-track SSE streaming |
 
 ---
 
@@ -4213,13 +4758,13 @@ intent → rejection → END
 
 ```text
 event: token
-data: {"content": "Based"}
+data: {"content": "根据"}
 
 event: token
-data: {"content": " on"}
+data: {"content": "当前"}
 
 event: token
-data: {"content": " current"}
+data: {"content": "数据"}
 
 ... more tokens ...
 
@@ -4227,7 +4772,7 @@ event: structured_data
 data: {"assets": [{"symbol": "TSLA", "price": 221.13, "change": 5.20, "change_pct": 2.4, "trend": "bullish", "market_metrics": {...}, "chart_data": {...}}]}
 
 event: citations
-data: [{"title": "...", "url": "...", "source_type": "web"}, ...]
+data: [{"title": "特斯拉今日股价分析", "url": "https://...", "source_type": "web"}, ...]
 
 event: done
 data: {"session_id": "550e8400-..."}
