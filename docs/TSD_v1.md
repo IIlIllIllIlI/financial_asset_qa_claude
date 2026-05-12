@@ -1,4 +1,4 @@
-# SPD.md — Financial Asset QA System
+# TSD.md — Financial Asset QA System
 # Part 1 — Core System Architecture & Engineering Specification
 
 ---
@@ -13,7 +13,8 @@ Financial Asset QA System
 
 ## 1.2 Project Goal
 
-Design and implement an AI-native fullstack financial question-answering system powered by LLMs, external market APIs, RAG pipelines, and LangGraph orchestration.
+Design and implement an AI-native fullstack financial question-answering system powered by
+LLMs, external market APIs, RAG pipelines, and LangGraph orchestration.
 
 The system focuses on:
 
@@ -60,6 +61,7 @@ over:
 | UI Library | React 19 |
 | Styling | TailwindCSS |
 | Component System | shadcn/ui |
+| Theme | next-themes (dark mode support) |
 | Markdown Rendering | react-markdown |
 | Markdown Extensions | remark-gfm |
 | Syntax Highlighting | rehype-highlight |
@@ -80,7 +82,7 @@ over:
 | Validation | Pydantic v2 |
 | ORM | SQLAlchemy |
 | Database | SQLite |
-| Vector Database | Chroma |
+| Vector Database | Chroma (persist mode) |
 | Embedding Model | BAAI/bge-small-en-v1.5 |
 | Streaming | SSE |
 | Testing | pytest |
@@ -93,10 +95,36 @@ over:
 
 | Service | Usage |
 |---|---|
-| Yahoo Finance | Market data |
-| Tavily Search | Web search |
-| Tavily Extract | Web content extraction |
-| OpenAI-compatible APIs | LLM inference |
+| Yahoo Finance | Market data (via `yfinance`) |
+| Tavily Search | Web search for financial news |
+| Tavily Extract | Web content extraction for full article text |
+| MiniMax API (OpenAI-compatible) | LLM inference (MiniMax-M2.7 model) |
+
+---
+
+## 2.4 LLM Model Configuration
+
+During development and testing, all LLM tasks use **MiniMax-M2.7**:
+
+| Task | Model | Method |
+|---|---|---|
+| Intent Classification | MiniMax-M2.7 | function_calling |
+| Response Generation | MiniMax-M2.7 | chat completion + streaming |
+| Rerank | MiniMax-M2.7 | chat completion |
+| Title Generation | MiniMax-M2.7 | chat completion |
+| Unsupported Query Rejection | MiniMax-M2.7 | chat completion |
+
+All model configuration is externalized to `.env`:
+
+```
+MINIMAX_API_KEY=...
+MINIMAX_BASE_URL=https://api.minimaxi.com/v1
+MINIMAX_MODEL=MiniMax-M2.7
+TAVILY_API_KEY=...
+```
+
+The LLM provider abstraction supports any OpenAI-compatible API — switching
+to a different provider only requires changing environment variables.
 
 ---
 
@@ -144,10 +172,10 @@ LangGraph acts as:
 +--------------------------------------------------+
 |               LangGraph Workflow                 |
 |--------------------------------------------------|
-| Intent Router                                    |
+| Intent Router (LLM-based)                        |
 |   ├── Market Data Flow                           |
 |   ├── RAG Flow                                   |
-|   ├── Hybrid Flow                                |
+|   ├── Hybrid Flow (market + RAG in parallel)     |
 |   └── Unsupported Query Flow                     |
 +--------------------------------------------------+
                            |
@@ -168,7 +196,7 @@ LangGraph acts as:
 +--------------------------------------------------+
 |                 Persistence Layer                |
 |--------------------------------------------------|
-| SQLite | ChromaDB | Local File Storage           |
+| SQLite | ChromaDB (persist) | Local File Storage |
 +--------------------------------------------------+
 ```
 
@@ -293,7 +321,7 @@ The left sidebar manages:
 - conversation list
 - session switching
 - new chat creation
-- auto-generated titles
+- auto-generated titles (via LLM after first user message)
 
 ---
 
@@ -301,12 +329,12 @@ The left sidebar manages:
 
 The center chat area manages:
 
-- markdown rendering
-- streaming response rendering
+- markdown rendering (react-markdown + remark-gfm + rehype-highlight)
+- streaming response rendering (fetch + ReadableStream, NOT EventSource)
 - user input
-- loading states
-- citations
-- tool execution status
+- loading states (thinking indicator during tool execution)
+- citations display
+- tool execution status (e.g., "Fetching market data...")
 
 ---
 
@@ -315,12 +343,12 @@ The center chat area manages:
 The right market panel displays:
 
 - current asset price
-- daily change
-- 7-day trend chart
+- daily change (absolute and percentage)
+- 7-day trend chart (Recharts line chart)
 - PE ratio
 - market cap
 - trading volume
-- detected active asset
+- detected active asset ticker
 
 This panel updates dynamically based on:
 
@@ -332,20 +360,32 @@ returned by backend responses.
 
 ---
 
+## 5.5 Dark Mode
+
+Implemented via `next-themes` + Tailwind `dark:` classes.
+
+- Theme switcher in the header/footer
+- System preference detection on first load
+- All shadcn/ui components automatically support dark mode
+
+---
+
 # 6. Backend Architecture
 
 ## 6.1 Backend Layers
 
 ```text
-api/
-↓
-graph/
-↓
-tools/
-↓
-repositories/
-↓
-database
+api/           (routes + schemas + dependencies)
+  ↓
+graph/         (LangGraph orchestration)
+  ↓
+tools/         (external service integrations)
+  ↓
+services/      (business logic: session_service, rag_service, streaming_service, title_service)
+  ↓
+repositories/  (DB access abstraction)
+  ↓
+database/      (SQLAlchemy ORM + SQLite)
 ```
 
 ---
@@ -354,11 +394,12 @@ database
 
 | Layer | Responsibility |
 |---|---|
-| api | transport + SSE |
-| graph | orchestration |
-| tools | external integrations |
-| repositories | DB access |
-| database | persistence |
+| api | transport + SSE + validation |
+| graph | LangGraph orchestration: nodes, edges, state |
+| tools | external API wrappers (stateless) |
+| services | business workflows, streaming lifecycle, title generation |
+| repositories | DB CRUD, query abstraction, transaction isolation |
+| database | SQLAlchemy models, engine, migrations |
 
 ---
 
@@ -366,12 +407,13 @@ database
 
 The backend enforces:
 
-- strict typing
-- repository abstraction
-- isolated tool layer
+- strict typing (Python type hints everywhere)
+- repository abstraction (graph nodes never touch DB directly)
+- isolated tool layer (graph nodes never call external APIs directly)
 - graph-based orchestration
-- Pydantic validation
-- async-first design
+- Pydantic v2 validation
+- async-first design (`async def` for all endpoints)
+- all structured output via `model.with_structured_output(schema, method="function_calling")`
 
 ---
 
@@ -382,61 +424,146 @@ The backend enforces:
 ```text
 User Query
     ↓
-Intent Router
-    ├── Market Query
-    ├── RAG Query
-    ├── Hybrid Query
-    └── Unsupported Query
+Intent Router (LLM-based, function_calling)
+    ├── "market" → Market Query Flow
+    ├── "rag"    → RAG Query Flow
+    ├── "hybrid" → Hybrid Query Flow
+    └── "unsupported" → Unsupported Query Flow
 ```
 
 ---
 
-## 7.2 Market Query Flow
+## 7.2 Intent Classification
+
+Intent classification uses **LLM with function_calling** (NOT keyword matching).
+
+```python
+class IntentOutput(BaseModel):
+    intent: Literal["market", "rag", "hybrid", "unsupported"]
+    confidence: float
+    reasoning: str
+
+# Usage:
+intent_result = model.with_structured_output(
+    IntentOutput,
+    method="function_calling",
+).invoke(intent_prompt + user_query)
+```
+
+Intent examples:
+- **market**: "What is Tesla's current stock price?", "Show me AAPL market cap", "How did NVDA perform this week?"
+- **rag**: "What is PE ratio?", "Explain discounted cash flow valuation", "What does EBITDA mean?"
+- **hybrid**: "Why did Tesla stock rise and what does PE ratio indicate?", "Explain NVDA's current valuation based on its PE"
+- **unsupported**: "Write me a poem about stocks", "Tell me a joke"
+
+---
+
+## 7.3 Market Query Flow
 
 ```text
-Market Query
+User Query → Intent Node (routes to "market")
     ↓
-Market Tool Node
-    ↓
-News Search Node
+Market Data Tool Node
+    ├── Fetch price, metrics from Yahoo Finance
+    ├── Fetch related news from Tavily Search
+    └── Extract full article content via Tavily Extract (if needed)
     ↓
 Response Generation Node
+    ├── Build market analysis prompt with fetched data
+    ├── LLM generates markdown response
+    └── Extract structured_data via function_calling
     ↓
 Structured Formatter Node
+    ├── Normalize structured_data
+    ├── Assemble citations
+    └── Set final_response
+    ↓
+Stream to Frontend via SSE
 ```
 
 ---
 
-## 7.3 RAG Query Flow
+## 7.4 RAG Query Flow
 
 ```text
-RAG Query
+User Query → Intent Node (routes to "rag")
     ↓
-Retriever Node
+Retrieval Node
+    ├── Embed user query
+    ├── Similarity search in Chroma (top-k = 8)
+    └── Return retrieved chunks with metadata
     ↓
 Lightweight Rerank Node
+    ├── LLM selects best chunks from top-k (output top-4)
+    └── Discard irrelevant chunks
     ↓
 Context Builder
+    ├── Assemble final context from reranked chunks
+    └── Include document source metadata
     ↓
 Response Generation Node
+    ├── Build RAG prompt with context + user query
+    ├── LLM generates grounded markdown response
+    └── Extract citations
+    ↓
+Stream to Frontend via SSE
 ```
 
 ---
 
-## 7.4 Hybrid Query Flow
+## 7.5 Hybrid Query Flow
 
-Hybrid queries combine:
-
-- market data
-- financial concepts
-- news explanations
-- RAG retrieval
-
-Example:
+Hybrid queries combine market data AND RAG retrieval sequentially:
 
 ```text
-Why did Tesla stock fall recently and what does its PE ratio imply?
+User Query → Intent Node (routes to "hybrid")
+    ↓
+Phase 1: Market Data Node (Yahoo Finance)
+    ↓
+Phase 2: News Node (Tavily Search)
+    ↓
+Phase 3: Retrieval Node (Chroma search)
+    ↓
+Phase 4: Rerank Node (LLM selects best chunks)
+    ↓
+Phase 5: Merge Node (combine all context: market + news + RAG)
+    ↓
+Phase 6: Response Generation Node
+    (LLM synthesizes market data, news, and retrieved knowledge)
+    ↓
+Phase 7: Structured Formatter Node
+    ↓
+Stream to Frontend via SSE
 ```
+
+The hybrid flow runs both phases sequentially (market data + news first, then RAG).
+Phase 5 (merge) combines all gathered context — market metrics, news articles,
+and retrieved document chunks — into a single prompt for the generation LLM.
+
+Example hybrid query:
+
+```text
+"Why did Tesla stock fall recently and what does its PE ratio imply?"
+```
+
+---
+
+## 7.6 Unsupported Query Flow
+
+Unsupported queries still route through LLM for a friendly, helpful rejection:
+
+```text
+User Query → Intent Node (routes to "unsupported")
+    ↓
+Rejection Node
+    ├── LLM generates friendly, helpful message
+    ├── Explains the system's scope (market data + financial knowledge)
+    └── Suggests rephrasing or trying a different question
+    ↓
+Stream to Frontend via SSE
+```
+
+The rejection message should be polite and informative, not a cold error.
 
 ---
 
@@ -457,28 +584,41 @@ No untyped state objects are allowed.
 ## 8.2 GraphState Schema
 
 ```python
+from typing import TypedDict, Optional
+
+
 class GraphState(TypedDict):
+    """LangGraph workflow state. All fields serializable."""
+
     session_id: str
 
     user_query: str
 
-    messages: list
+    # Reconstructed conversation history (loaded from DB at start)
+    messages: list[dict]
 
-    intent: str
+    # Intent routing
+    intent: str                      # "market" | "rag" | "hybrid" | "unsupported"
 
-    retrieved_docs: list
+    # RAG
+    retrieved_docs: list[dict]       # top-k chunks from Chroma
+    reranked_docs: list[dict]        # top-N chunks after LLM rerank (N=4)
 
-    reranked_docs: list
+    # Market data
+    market_data: dict                # raw normalized market data
+    news_data: list[dict]            # Tavily search results
 
-    market_data: dict
+    # Citations
+    citations: list[dict]            # [{"title": "...", "url": "...", "source_type": "..."}]
 
-    citations: list
+    # Structured data for frontend panel/charts
+    structured_data: dict            # active_asset, price, change_pct, trend, metrics, chart_data
 
-    structured_data: dict
+    # Final output
+    final_response: str              # markdown answer
 
-    final_response: str
-
-    error: str | None
+    # Error state (fail-fast)
+    error: Optional[dict]            # {"type": "...", "message": "..."}
 ```
 
 ---
@@ -487,11 +627,11 @@ class GraphState(TypedDict):
 
 State objects must remain:
 
-- serializable
+- serializable (all values JSON-serializable, no lambdas, no complex objects)
 - deterministic
 - debuggable
-- minimal
-- explicit
+- minimal (don't carry data between nodes that don't need it)
+- explicit (no hidden state mutations across nodes)
 
 ---
 
@@ -499,10 +639,10 @@ State objects must remain:
 
 ## 9.1 Databases
 
-| Database | Usage |
-|---|---|
-| SQLite | relational persistence |
-| Chroma | vector retrieval |
+| Database | Usage | Path |
+|---|---|---|
+| SQLite | relational persistence | `./backend/data/sqlite.db` |
+| Chroma | vector retrieval (persist mode) | `./backend/chroma_db/` |
 
 ---
 
@@ -518,18 +658,20 @@ SQLite stores:
 SQLite does NOT store:
 
 - embeddings
-- market cache
+- market cache (in-memory TTLCache only)
 - raw vector data
 
 ---
 
 ## 9.3 Chroma Responsibilities
 
-Chroma stores:
+Chroma (persist mode) stores:
 
 - document chunks
 - embeddings
 - vector metadata
+
+Chroma data persists across restarts — no need to re-ingest documents on every startup.
 
 ---
 
@@ -539,10 +681,10 @@ Chroma stores:
 
 ```sql
 CREATE TABLE chat_sessions (
-    id TEXT PRIMARY KEY,
-    title TEXT NOT NULL,
-    created_at DATETIME NOT NULL,
-    updated_at DATETIME NOT NULL
+    id TEXT PRIMARY KEY,              -- UUID4
+    title TEXT NOT NULL,              -- auto-generated via LLM after first query
+    created_at TEXT NOT NULL,         -- UTC ISO 8601
+    updated_at TEXT NOT NULL          -- UTC ISO 8601
 );
 ```
 
@@ -552,12 +694,12 @@ CREATE TABLE chat_sessions (
 
 ```sql
 CREATE TABLE chat_messages (
-    id TEXT PRIMARY KEY,
+    id TEXT PRIMARY KEY,              -- UUID4
     session_id TEXT NOT NULL,
-    role TEXT NOT NULL,
-    content TEXT NOT NULL,
-    metadata_json TEXT,
-    created_at DATETIME NOT NULL,
+    role TEXT NOT NULL,               -- "user" | "assistant" | "system"
+    content TEXT NOT NULL,            -- markdown for assistant, plain text for user
+    metadata_json TEXT,               -- JSON string of structured_data + citations
+    created_at TEXT NOT NULL,         -- UTC ISO 8601
 
     FOREIGN KEY(session_id)
     REFERENCES chat_sessions(id)
@@ -570,11 +712,11 @@ CREATE TABLE chat_messages (
 
 ```sql
 CREATE TABLE knowledge_documents (
-    id TEXT PRIMARY KEY,
+    id TEXT PRIMARY KEY,              -- UUID4
     title TEXT NOT NULL,
-    source TEXT NOT NULL,
+    source TEXT NOT NULL,             -- original file name
     chunk_count INTEGER NOT NULL,
-    created_at DATETIME NOT NULL
+    created_at TEXT NOT NULL          -- UTC ISO 8601
 );
 ```
 
@@ -584,12 +726,20 @@ CREATE TABLE knowledge_documents (
 
 ```sql
 CREATE TABLE ingestion_jobs (
-    id TEXT PRIMARY KEY,
+    id TEXT PRIMARY KEY,              -- UUID4
     file_name TEXT NOT NULL,
-    status TEXT NOT NULL,
-    created_at DATETIME NOT NULL
+    status TEXT NOT NULL,             -- "pending" | "processing" | "completed" | "failed"
+    error_message TEXT,
+    created_at TEXT NOT NULL          -- UTC ISO 8601
 );
 ```
+
+---
+
+## 10.5 ID Generation
+
+All primary keys use **UUID4** (generated via Python `uuid.uuid4()` or equivalent in TypeScript).
+No auto-increment integers. No custom prefixes.
 
 ---
 
@@ -618,15 +768,15 @@ instead of persistent agent memory runtime.
 ```text
 User sends query
     ↓
-Load session messages from SQLite
+Load session messages from SQLite (via MessageRepository)
     ↓
-Reconstruct conversation history
+Reconstruct conversation history as list[dict]
     ↓
-Inject into graph state
+Inject into GraphState.messages
     ↓
-Generate response
+Graph executes (intent → tools → generation)
     ↓
-Persist new messages
+Persist user message + assistant response + metadata to SQLite
 ```
 
 ---
@@ -635,9 +785,9 @@ Persist new messages
 
 Frontend supports:
 
-- switching sessions
-- restoring previous conversations
-- continuing old conversations
+- switching sessions via sidebar
+- restoring previous conversations (load messages from SQLite)
+- continuing old conversations (append new messages to existing session)
 
 ---
 
@@ -647,36 +797,38 @@ Frontend supports:
 
 Supported:
 
-- pdf
-- md
-- txt
+- `.pdf`
+- `.md`
+- `.txt`
 
 Not supported:
 
-- docx
-- pptx
-- html
+- `.docx`
+- `.pptx`
+- `.html`
 
 ---
 
 ## 12.2 RAG Pipeline
 
 ```text
-Documents
+Documents (uploaded via API)
     ↓
-Chunking
+Parse (extract text based on file type)
     ↓
-Embedding
+Chunk (split text into overlapping chunks)
     ↓
-Chroma Storage
+Embed (BAAI/bge-small-en-v1.5, local model)
     ↓
-Similarity Retrieval
+Chroma Storage (persist to disk)
     ↓
-Lightweight LLM Rerank
+Similarity Retrieval (cosine similarity, top-k=8)
     ↓
-Context Builder
+Lightweight LLM Rerank (MiniMax-M2.7 selects top-4)
     ↓
-LLM Generation
+Context Builder (assemble final context)
+    ↓
+LLM Generation (grounded in retrieved context)
 ```
 
 ---
@@ -684,9 +836,11 @@ LLM Generation
 ## 12.3 Chunking Strategy
 
 ```text
-chunk_size = 800
-chunk_overlap = 150
+chunk_size = 800 characters
+chunk_overlap = 150 characters
 ```
+
+Use LangChain's `RecursiveCharacterTextSplitter`.
 
 ---
 
@@ -696,6 +850,8 @@ chunk_overlap = 150
 BAAI/bge-small-en-v1.5
 ```
 
+Local model loaded via `sentence-transformers` or `langchain_community.embeddings.HuggingFaceEmbeddings`.
+
 ---
 
 ## 12.5 Lightweight Rerank Strategy
@@ -703,22 +859,39 @@ BAAI/bge-small-en-v1.5
 The rerank stage uses:
 
 ```text
-LLM-based reranking
+LLM-based reranking (MiniMax-M2.7)
 ```
 
-instead of:
-
+Instead of:
 - cross-encoder rerankers
 - heavyweight rerank models
+- additional infrastructure
 
 Workflow:
 
 ```text
-Top-K Retrieval
+Top-8 chunks from Chroma
     ↓
-LLM selects best chunks
+LLM evaluates each chunk's relevance to query
     ↓
-Final context assembly
+LLM selects top-4 most relevant chunks
+    ↓
+Final context assembly (ordered by relevance)
+```
+
+---
+
+## 12.6 Chunk Metadata
+
+Every chunk stored in Chroma must include:
+
+```json
+{
+  "document_id": "<UUID4>",
+  "document_name": "financial_glossary.md",
+  "chunk_index": 0,
+  "source": "uploaded"
+}
 ```
 
 ---
@@ -746,9 +919,9 @@ yfinance
 The system supports:
 
 - current price
-- daily change
-- 7-day trend
-- 30-day trend
+- daily change (absolute and percentage)
+- 7-day historical prices (for charts)
+- 30-day historical prices (for charts)
 - PE ratio
 - market cap
 - trading volume
@@ -766,10 +939,20 @@ cachetools.TTLCache
 Configuration:
 
 ```python
-TTL = 60 seconds
+market_data_cache = TTLCache(maxsize=128, ttl=60)  # 60 seconds TTL
 ```
 
 No Redis or distributed cache will be used.
+
+---
+
+## 13.4 News Search
+
+Market queries automatically trigger news search via **Tavily Search**:
+
+- Search for "[TICKER] stock news today"
+- Return top 5 results with URLs and snippets
+- Optionally extract full content via **Tavily Extract** for key articles
 
 ---
 
@@ -779,10 +962,12 @@ No Redis or distributed cache will be used.
 
 All APIs must:
 
-- use Pydantic schemas
-- be fully typed
+- use Pydantic v2 schemas
+- be fully typed (request + response)
 - support async execution
 - return deterministic structures
+- use UTC ISO 8601 timestamps
+- use JSON exclusively
 
 ---
 
@@ -790,10 +975,10 @@ All APIs must:
 
 | Category | Purpose |
 |---|---|
-| Chat APIs | conversation |
-| Session APIs | session management |
-| RAG APIs | document ingestion |
-| Health APIs | diagnostics |
+| Chat APIs | conversation + streaming |
+| Session APIs | session CRUD |
+| RAG APIs | document upload + ingestion |
+| Health APIs | system diagnostics |
 
 ---
 
@@ -801,13 +986,13 @@ All APIs must:
 
 | Method | Endpoint | Purpose |
 |---|---|---|
-| POST | /api/chat | send message |
-| GET | /api/sessions | list sessions |
-| POST | /api/sessions | create session |
-| GET | /api/sessions/{id} | load session |
-| DELETE | /api/sessions/{id} | delete session |
-| POST | /api/rag/upload | upload document |
-| GET | /api/health | health check |
+| POST | `/api/chat` | send message, returns SSE stream or JSON |
+| GET | `/api/sessions` | list all sessions |
+| POST | `/api/sessions` | create new session (auto-generates title later) |
+| GET | `/api/sessions/{id}` | load session detail + messages |
+| DELETE | `/api/sessions/{id}` | delete session + all messages |
+| POST | `/api/rag/upload` | upload document for ingestion |
+| GET | `/api/health` | system health check |
 
 ---
 
@@ -818,10 +1003,15 @@ All APIs must:
 The system uses:
 
 ```text
-event-based SSE
+event-based SSE (text/event-stream)
 ```
 
 instead of raw token streaming.
+
+Frontend consumes via `fetch` + `ReadableStream` (NOT `EventSource`):
+- Supports POST requests
+- Supports custom headers (future auth expansion)
+- Supports cancellation via `AbortController`
 
 ---
 
@@ -829,56 +1019,48 @@ instead of raw token streaming.
 
 ### Token Event
 
-```json
-{
-  "event": "token",
-  "data": "Tesla"
-}
+```text
+event: token
+data: {"content": "Tesla"}
+
+event: token
+data: {"content": " stock"}
 ```
 
 ---
 
-### Structured Data Event
+### Structured Data Event (sent once, after generation)
 
-```json
-{
-  "event": "structured_data",
-  "data": {}
-}
+```text
+event: structured_data
+data: {"active_asset": "TSLA", "price": 221.13, "change_pct": 2.4, "trend": "bullish", "market_metrics": {...}, "chart_data": {...}}
 ```
 
 ---
 
-### Citation Event
+### Citation Event (sent after structured_data)
 
-```json
-{
-  "event": "citations",
-  "data": []
-}
+```text
+event: citations
+data: [{"title": "Tesla Stock Today", "url": "https://...", "source_type": "web"}, {"title": "PE Ratio Explained", "url": "", "source_type": "rag"}]
 ```
 
 ---
 
-### Completion Event
+### Completion Event (sent last)
 
-```json
-{
-  "event": "done"
-}
+```text
+event: done
+data: {"session_id": "550e8400-e29b-41d4-a716-446655440000"}
 ```
 
 ---
 
-### Error Event
+### Error Event (sent on failure, terminates stream)
 
-```json
-{
-  "event": "error",
-  "data": {
-    "message": "..."
-  }
-}
+```text
+event: error
+data: {"type": "MarketAPIError", "message": "Failed to retrieve market data for TSLA"}
 ```
 
 ---
@@ -889,10 +1071,10 @@ instead of raw token streaming.
 
 ```text
 repositories/
-├── session_repository.py
-├── message_repository.py
-├── document_repository.py
-└── ingestion_repository.py
+├── session_repository.py    # ChatSession CRUD
+├── message_repository.py    # ChatMessage CRUD + query by session_id
+├── document_repository.py   # KnowledgeDocument CRUD
+└── ingestion_repository.py  # IngestionJob CRUD
 ```
 
 ---
@@ -901,7 +1083,7 @@ repositories/
 
 Repositories ONLY manage:
 
-- DB CRUD
+- DB CRUD operations
 - query abstraction
 - transaction isolation
 
@@ -910,6 +1092,7 @@ Repositories must NOT contain:
 - LLM logic
 - orchestration logic
 - business workflows
+- external API calls
 
 ---
 
@@ -925,10 +1108,12 @@ tools/
 
 This includes:
 
-- market APIs
-- web search
-- rerank
-- vector retrieval
+- market APIs (Yahoo Finance)
+- web search (Tavily)
+- web content extraction (Tavily Extract)
+- vector retrieval (Chroma)
+- LLM rerank
+- embedding
 
 ---
 
@@ -936,12 +1121,13 @@ This includes:
 
 ```text
 tools/
-├── market_data_tool.py
-├── tavily_search_tool.py
-├── tavily_extract_tool.py
-├── retrieval_tool.py
-├── rerank_tool.py
-└── embedding_tool.py
+├── market_data_tool.py      # Yahoo Finance wrapper
+├── tavily_search_tool.py    # Tavily Search API wrapper
+├── tavily_extract_tool.py   # Tavily Extract API wrapper
+├── retrieval_tool.py        # Chroma vector search
+├── rerank_tool.py           # LLM-based reranking
+├── embedding_tool.py        # Embedding model (BAAI/bge-small)
+└── llm_tool.py              # LLM provider factory (reads config, returns provider)
 ```
 
 ---
@@ -950,10 +1136,11 @@ tools/
 
 Tools must:
 
-- be stateless
-- be independently testable
-- expose typed interfaces
+- be stateless (pure functions or class with no mutable state)
+- be independently testable (mock at boundary)
+- expose typed interfaces (Pydantic input/output)
 - avoid side effects
+- never import from `repositories/` or `graph/`
 
 ---
 
@@ -965,30 +1152,52 @@ Frontend state management uses:
 
 | Tool | Responsibility |
 |---|---|
-| Zustand | UI state |
-| TanStack Query | server state |
+| Zustand | UI state only |
+| TanStack Query | server state (API data, cache, refetching) |
 
 ---
 
 ## 18.2 Zustand Responsibilities
 
-Zustand stores:
+Zustand stores ONLY UI state:
 
-- active session
-- sidebar state
-- streaming state
-- UI preferences
+- `activeSessionId: string | null`
+- `sidebarOpen: boolean`
+- `streamingTokens: string` (accumulated during SSE streaming)
+- `isStreaming: boolean`
+- `theme: "light" | "dark" | "system"`
 
 ---
 
 ## 18.3 TanStack Query Responsibilities
 
-TanStack Query manages:
+TanStack Query manages ONLY server state:
 
-- API fetching
-- cache
-- refetching
-- optimistic updates
+- session list (`useQuery` for GET /api/sessions)
+- session detail + messages (`useQuery` for GET /api/sessions/{id})
+- mutation hooks for POST/DELETE operations
+- cache invalidation on mutations
+
+---
+
+## 18.4 Streaming State Flow
+
+```text
+User clicks "Send"
+    ↓
+Zustand: isStreaming = true, streamingTokens = ""
+    ↓
+POST /api/chat with fetch + ReadableStream
+    ↓
+Each "token" SSE event: Zustand appends to streamingTokens
+    ↓
+"structured_data" event: Zustand stores for market panel
+    ↓
+"citations" event: Zustand stores citations
+    ↓
+"done" event: Zustand isStreaming = false
+              TanStack Query invalidates session messages cache
+```
 
 ---
 
@@ -998,20 +1207,32 @@ TanStack Query manages:
 
 ```text
 react-markdown
-remark-gfm
-rehype-highlight
+remark-gfm          (GitHub Flavored Markdown: tables, strikethrough, task lists)
+rehype-highlight    (syntax highlighting for code blocks)
 ```
 
 ---
 
 ## 19.2 Supported Markdown Features
 
-- headings
+- headings (H1-H6)
 - tables
-- bullet lists
-- code blocks
+- bullet lists (ordered + unordered)
+- code blocks with syntax highlighting
 - inline code
 - links
+- bold / italic
+- blockquotes
+
+---
+
+## 19.3 Security Rules
+
+Markdown rendering must:
+
+- sanitize HTML (no raw HTML passthrough)
+- disable `dangerouslySetInnerHTML` equivalents
+- use `rehype-sanitize` if raw HTML support is needed later
 
 ---
 
@@ -1027,9 +1248,33 @@ Recharts
 
 ## 20.2 Supported Charts
 
-- 7-day line chart
-- 30-day line chart
-- price trend chart
+- 7-day price line chart
+- 30-day price line chart
+- (Charts rendered in Market Panel using `structured_data.chart_data`)
+
+---
+
+## 20.3 Chart Data Flow
+
+Charts use historical data returned by the backend in `structured_data.chart_data`:
+
+```json
+{
+  "chart_data": {
+    "7d": [
+      {"date": "2026-05-05", "close": 218.50},
+      {"date": "2026-05-06", "close": 220.10},
+      "..."
+    ],
+    "30d": [
+      {"date": "2026-04-12", "close": 205.30},
+      "..."
+    ]
+  }
+}
+```
+
+The frontend does NOT call Yahoo Finance directly — all data flows through the backend.
 
 ---
 
@@ -1037,16 +1282,24 @@ Recharts
 
 ## 21.1 Title Generation Strategy
 
-After first user query:
+After the first user query in a new session:
 
 ```text
-LLM generates short session title
+1. Persist user message + assistant response
+2. Async call LLM (MiniMax-M2.7) with prompt:
+   "Generate a short title (max 5 words) for this conversation.
+    Query: {user_query}
+    Response summary: {response_summary}"
+3. Update session title in SQLite
+4. Frontend refetches session list to show new title
 ```
 
-Example:
+Example titles:
 
 ```text
-Tesla Stock Analysis
+"Tesla Stock Analysis"
+"PE Ratio Explanation"
+"NVIDIA Market Trends 2026"
 ```
 
 ---
@@ -1063,10 +1316,20 @@ start_project.bat
 
 Responsibilities:
 
-- start backend
-- start frontend
-- initialize environment
-- launch both terminals
+- activate backend virtual environment
+- install dependencies if needed
+- start FastAPI server on port 8000
+- start Next.js dev server on port 3000
+- open both in separate terminal windows
+
+---
+
+## 22.2 Port Configuration
+
+| Service | Port |
+|---|---|
+| Backend (FastAPI) | 8000 |
+| Frontend (Next.js) | 3000 |
 
 ---
 
@@ -1092,11 +1355,21 @@ Not focused on:
 
 ```text
 tests/
-├── unit/
-├── integration/
-├── api/
-├── e2e/
-└── fixtures/
+├── unit/           # isolated: repos, tools, services, graph nodes
+├── integration/    # RAG pipeline, market data, graph flows
+├── api/            # endpoint correctness
+├── e2e/            # Playwright real browser tests
+└── fixtures/       # test documents, mock data, graph states
+```
+
+---
+
+## 23.3 Testing Order
+
+All testing happens AFTER the full software implementation is complete:
+
+```text
+Implementation → Testing → Debug → Fix bugs
 ```
 
 ---
@@ -1115,17 +1388,29 @@ Logging prioritizes:
 
 ## 24.2 Required Logged Events
 
-- incoming requests
-- graph routing
-- tool invocation
-- retrieval results
-- rerank decisions
-- SSE lifecycle
-- API failures
+- incoming requests (method, path, session_id)
+- graph routing (intent classification result)
+- node execution (node name, duration)
+- tool invocation (tool name, arguments)
+- retrieval results (k, latency)
+- rerank decisions (chunks kept/discarded)
+- market API latency
+- SSE lifecycle (start, events sent, termination)
+- API failures (full error details)
 
 ---
 
-# SPD.md — Financial Asset QA System
+## 24.3 Log Format
+
+Structured logs preferred. Use Python `logging` with consistent format:
+
+```text
+[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s
+```
+
+---
+
+# TSD.md — Financial Asset QA System
 # Part 2 — File Structure, API Contracts, Graph Logic, Prompt System, and Detailed Engineering Specification
 
 ---
@@ -1155,7 +1440,7 @@ Reasoning:
 financial-asset-qa-system/
 ├── backend/
 ├── frontend/
-├── knowledge_base/
+├── knowledge_base/          # uploaded documents stored here
 ├── scripts/
 ├── tests/
 ├── docs/
@@ -1175,93 +1460,113 @@ financial-asset-qa-system/
 ```text
 backend/
 ├── app/
-│
+
 ├── api/
 │   ├── routes/
-│   │   ├── chat.py
-│   │   ├── sessions.py
-│   │   ├── rag.py
-│   │   └── health.py
+│   │   ├── chat.py              # POST /api/chat (SSE streaming)
+│   │   ├── sessions.py          # Session CRUD endpoints
+│   │   ├── rag.py               # POST /api/rag/upload
+│   │   └── health.py            # GET /api/health
 │   │
 │   ├── schemas/
-│   │   ├── chat.py
-│   │   ├── session.py
-│   │   ├── rag.py
-│   │   └── common.py
+│   │   ├── chat.py              # ChatRequest, ChatResponse
+│   │   ├── session.py           # SessionResponse, SessionDetailResponse
+│   │   ├── rag.py               # UploadResponse
+│   │   └── common.py            # ErrorResponse, HealthResponse
 │   │
-│   └── dependencies/
-│
+│   └── dependencies.py          # Depends() for DB session, LLM provider, config
+
 ├── graph/
-│   ├── builder.py
-│   ├── state.py
-│   ├── intent_classifier.py
+│   ├── builder.py               # Create, register nodes/edges, compile graph
+│   ├── state.py                 # GraphState TypedDict
+│   ├── intent_classifier.py     # LLM-based intent classification
 │   ├── nodes/
-│   │   ├── intent_node.py
-│   │   ├── market_node.py
-│   │   ├── retrieval_node.py
-│   │   ├── rerank_node.py
-│   │   ├── generation_node.py
-│   │   └── formatter_node.py
+│   │   ├── intent_node.py       # Classify intent, set state.intent
+│   │   ├── market_node.py       # Fetch Yahoo Finance data, set state.market_data
+│   │   ├── news_node.py         # Tavily search, set state.news_data
+│   │   ├── retrieval_node.py    # Chroma similarity search
+│   │   ├── rerank_node.py       # LLM rerank top-k chunks
+│   │   ├── merge_node.py        # Combine market + news + RAG context (hybrid only)
+│   │   ├── generation_node.py   # LLM response generation
+│   │   ├── formatter_node.py    # Normalize structured_data + citations
+│   │   └── rejection_node.py    # Friendly rejection for unsupported queries
 │   │
 │   └── edges/
-│
+│       ├── router.py            # Conditional edge: intent → next node
+│       └── conditions.py        # Edge condition functions
+
 ├── tools/
-│   ├── market_data_tool.py
-│   ├── tavily_search_tool.py
-│   ├── tavily_extract_tool.py
-│   ├── retrieval_tool.py
-│   ├── rerank_tool.py
-│   ├── embedding_tool.py
-│   └── llm_tool.py
-│
+│   ├── market_data_tool.py      # Yahoo Finance via yfinance
+│   ├── tavily_search_tool.py    # Tavily Search API
+│   ├── tavily_extract_tool.py   # Tavily Extract API
+│   ├── retrieval_tool.py        # Chroma vector search
+│   ├── rerank_tool.py           # LLM-based rerank
+│   ├── embedding_tool.py        # BAAI/bge-small-en-v1.5 embeddings
+│   └── llm_tool.py              # LLM provider factory + with_structured_output helper
+
 ├── repositories/
 │   ├── session_repository.py
 │   ├── message_repository.py
 │   ├── document_repository.py
 │   └── ingestion_repository.py
-│
+
 ├── services/
-│   ├── session_service.py
-│   ├── rag_service.py
-│   ├── streaming_service.py
-│   └── title_generation_service.py
-│
+│   ├── session_service.py       # Session lifecycle + title generation
+│   ├── rag_service.py           # Document parsing, chunking, ingestion orchestration
+│   ├── streaming_service.py     # SSE event formatting + lifecycle
+│   └── title_generation_service.py  # Async LLM title generation
+
 ├── database/
-│   ├── base.py
+│   ├── base.py                  # SQLAlchemy Base
 │   ├── models/
-│   ├── session.py
-│   ├── engine.py
-│   └── migrations/
-│
+│   │   ├── chat_session.py
+│   │   ├── chat_message.py
+│   │   ├── knowledge_document.py
+│   │   └── ingestion_job.py
+│   ├── session.py               # get_db session factory
+│   └── engine.py                # SQLAlchemy engine + connection
+
 ├── vectorstore/
-│   ├── chroma_client.py
-│   └── collections.py
-│
+│   ├── chroma_client.py         # Chroma client init (persist mode)
+│   └── collections.py           # Collection management + CRUD
+
 ├── prompts/
 │   ├── system/
+│   │   └── system_prompt.txt    # Main system prompt
 │   ├── market/
+│   │   ├── market_analysis.txt  # Market analysis prompt template
+│   │   └── market_structured.txt
 │   ├── rag/
+│   │   ├── rag_generation.txt   # RAG-grounded generation prompt
+│   │   └── rag_rerank.txt       # Rerank selection prompt
 │   ├── rerank/
-│   └── formatting/
-│
+│   │   └── rerank_selection.txt
+│   ├── formatting/
+│   │   └── structured_format.txt
+│   ├── intent/
+│   │   └── intent_classifier.txt # Intent classification prompt
+│   ├── rejection/
+│   │   └── unsupported_query.txt # Friendly rejection prompt
+│   └── title/
+│       └── title_generation.txt  # Session title generation prompt
+
 ├── providers/
-│   ├── base_provider.py
-│   ├── openai_provider.py
-│   ├── openrouter_provider.py
-│   └── mock_provider.py
-│
+│   ├── base_provider.py         # BaseLLMProvider abstract class
+│   ├── openai_provider.py       # OpenAI-compatible provider (covers MiniMax)
+│   └── mock_provider.py         # Mock provider for testing without real API keys
+
 ├── utils/
-│   ├── logger.py
-│   ├── markdown.py
-│   ├── token_counter.py
-│   ├── time.py
-│   └── errors.py
-│
+│   ├── logger.py                # Structured logging setup
+│   ├── markdown.py              # Markdown utilities (if needed server-side)
+│   ├── token_counter.py         # Token counting utilities
+│   ├── time.py                  # UTC timestamp helpers
+│   └── errors.py                # Custom exception classes
+
 ├── config/
-│   ├── settings.py
-│   └── constants.py
-│
-├── main.py
+│   ├── settings.py              # Pydantic Settings (reads .env)
+│   └── constants.py             # Non-configurable constants
+
+├── main.py                      # FastAPI app creation, router registration, startup
 └── requirements.txt
 ```
 
@@ -1274,58 +1579,101 @@ backend/
 ```text
 frontend/
 ├── src/
-│
+
 ├── app/
-│   ├── layout.tsx
-│   ├── page.tsx
-│   └── globals.css
-│
+│   ├── layout.tsx               # Root layout (providers: QueryClient, ThemeProvider, Zustand)
+│   ├── page.tsx                 # Main page: 3-panel layout
+│   └── globals.css              # Tailwind directives + custom scrollbar styles
+
 ├── components/
 │   ├── chat/
+│   │   ├── ChatContainer.tsx    # Chat area wrapper
+│   │   ├── ChatMessage.tsx      # Single message (markdown rendered)
+│   │   ├── ChatInput.tsx        # Text input + send button
+│   │   ├── StreamingMessage.tsx # In-progress streaming message (incremental render)
+│   │   └── CitationList.tsx     # Clickable citation links
+│   │
 │   ├── market/
+│   │   ├── MarketPanel.tsx      # Right panel container
+│   │   ├── PriceCard.tsx        # Current price + daily change
+│   │   ├── TrendChart.tsx       # Recharts line chart (7d/30d toggle)
+│   │   └── MetricsCard.tsx      # PE ratio, market cap, volume
+│   │
 │   ├── sidebar/
+│   │   ├── Sidebar.tsx          # Left panel container
+│   │   ├── SessionList.tsx      # Scrollable session list
+│   │   ├── SessionItem.tsx      # Single session row (title, date, active indicator)
+│   │   └── NewChatButton.tsx    # Create new session button
+│   │
 │   ├── markdown/
-│   ├── ui/
+│   │   └── MarkdownRenderer.tsx # react-markdown wrapper with plugins
+│   │
+│   ├── ui/                      # shadcn/ui components (generated)
+│   │   ├── button.tsx
+│   │   ├── input.tsx
+│   │   ├── toast.tsx
+│   │   ├── sonner.tsx           # Toast notification system
+│   │   └── ...
+│   │
 │   └── common/
-│
+│       ├── ErrorToast.tsx       # Toast error display + retry button
+│       └── ThemeToggle.tsx      # Dark/light/system theme switcher
+
 ├── features/
 │   ├── chat/
+│   │   └── useChatFeature.ts    # Composes useStreaming + useChat hook + chatStore
 │   ├── sessions/
+│   │   └── useSessionFeature.ts # Session CRUD operations
 │   ├── market/
+│   │   └── useMarketPanel.ts    # Derives market panel state from structured_data
 │   └── rag/
-│
+│       └── useRagUpload.ts      # Document upload mutation
+
 ├── services/
 │   ├── api/
+│   │   ├── client.ts            # Base fetch wrapper (base URL, error handling)
+│   │   ├── chat.ts              # POST /api/chat (streaming + non-streaming)
+│   │   ├── sessions.ts          # Session CRUD API calls
+│   │   ├── rag.ts               # POST /api/rag/upload
+│   │   └── health.ts            # GET /api/health
+│   │
 │   ├── sse/
+│   │   └── sseClient.ts         # fetch + ReadableStream SSE parser
+│   │
 │   └── session/
-│
+│       └── sessionManager.ts    # Session lifecycle helpers
+
 ├── hooks/
-│   ├── useChat.ts
-│   ├── useStreaming.ts
-│   ├── useSessions.ts
-│   └── useMarketPanel.ts
-│
+│   ├── useChat.ts               # Chat message sending + response handling
+│   ├── useStreaming.ts          # SSE stream consumption + state updates
+│   ├── useSessions.ts           # TanStack Query hooks for sessions
+│   └── useMarketPanel.ts        # Market panel data derivation
+
 ├── stores/
-│   ├── sessionStore.ts
-│   ├── chatStore.ts
-│   └── uiStore.ts
-│
+│   ├── sessionStore.ts          # Zustand: activeSessionId, sidebarOpen
+│   ├── chatStore.ts             # Zustand: streamingTokens, isStreaming, messages cache
+│   └── uiStore.ts               # Zustand: theme preference, toasts
+
 ├── types/
-│   ├── api.ts
-│   ├── session.ts
-│   ├── chat.ts
-│   └── market.ts
-│
+│   ├── api.ts                   # API request/response types
+│   ├── session.ts               # Session, SessionDetail types
+│   ├── chat.ts                  # ChatMessage, StreamingEvent types
+│   └── market.ts                # MarketData, ChartData types
+
 ├── lib/
-│   ├── markdown.ts
-│   ├── utils.ts
-│   └── constants.ts
-│
+│   ├── markdown.ts              # Markdown components customization
+│   ├── utils.ts                 # General utilities
+│   └── constants.ts             # API base URL, config constants
+
 ├── tests/
 │   └── e2e/
-│
+│       ├── chat.spec.ts
+│       ├── session.spec.ts
+│       ├── rag.spec.ts
+│       ├── streaming.spec.ts
+│       └── market_panel.spec.ts
+
 ├── public/
-│
 ├── package.json
 ├── tailwind.config.ts
 ├── tsconfig.json
@@ -1340,11 +1688,11 @@ frontend/
 
 All APIs must:
 
-- use JSON
-- use typed Pydantic schemas
+- use JSON for request/response bodies
+- use typed Pydantic v2 schemas
 - return deterministic structures
-- use UTC timestamps
-- support async execution
+- use UTC ISO 8601 timestamps
+- support async execution (`async def`)
 
 ---
 
@@ -1354,337 +1702,664 @@ All APIs must:
 
 ```http
 POST /api/chat
+Accept: text/event-stream (for streaming)
+Content-Type: application/json
 ```
 
 ---
 
 ## 29.2 Request Schema
 
-````python
+```python
 class ChatRequest(BaseModel):
-    session_id: str
-    query: str
-    stream: bool = True
-````
+    session_id: str          # UUID4
+    query: str               # user's natural language query
+    stream: bool = True      # True = SSE, False = JSON response
+```
+
 ---
 
 ## 29.3 Non-Streaming Response
-```` Python
+
+```python
 class ChatResponse(BaseModel):
     answer_markdown: str
     structured_data: dict
-    citations: list[str]
-    metadata: dict
-````
+    citations: list[Citation]
+    metadata: dict            # session_id, intent, processing_time_ms
+```
+
 ---
 
 ## 29.4 Streaming Response
-Streaming uses:
-``` 
-text/event-stream
-```
-with event-based payloads.
+
+Streaming uses `text/event-stream` with event-based payloads.
+
+SSE event types: `token`, `structured_data`, `citations`, `done`, `error`
 
 ---
 
 # 30. Session APIs
+
 ## 30.1 Create Session
-``` http
+
+```http
 POST /api/sessions
 ```
 
----
+Response:
 
-## 30.2 Response
-``` Python
+```python
 class SessionResponse(BaseModel):
-    id: str
-    title: str
-    created_at: datetime
-    updated_at: datetime
+    id: str              # UUID4
+    title: str           # default "New Chat" until first query
+    created_at: str      # UTC ISO 8601
+    updated_at: str      # UTC ISO 8601
 ```
 
 ---
 
-## 30.3 List Sessions
-``` http
+## 30.2 List Sessions
+
+```http
 GET /api/sessions
 ```
 
+Returns `list[SessionResponse]`, ordered by `updated_at` descending.
+
 ---
 
-## 30.4 Load Session
-``` http
+## 30.3 Load Session
+
+```http
 GET /api/sessions/{session_id}
 ```
 
----
+Response:
 
-## 30.5 Session Detail Response
-``` Python
+```python
 class SessionDetailResponse(BaseModel):
     session: SessionResponse
-    messages: list[ChatMessage]
+    messages: list[ChatMessageSchema]
 ```
+
+---
+
+## 30.4 Delete Session
+
+```http
+DELETE /api/sessions/{session_id}
+```
+
+Returns `204 No Content` on success.
 
 ---
 
 # 31. RAG Upload API
+
 ## 31.1 Endpoint
-``` http
+
+```http
 POST /api/rag/upload
+Content-Type: multipart/form-data
 ```
+
+Request body: file field named `file` (`.pdf`, `.md`, or `.txt`).
+
 ---
 
-## 31.2 Supported Formats
-- pdf
-- md
-- txt
+## 31.2 Upload Processing
+
+```text
+1. Receive file via multipart upload
+2. Validate file type (.pdf, .md, .txt only)
+3. Save to knowledge_base/{uuid}_{original_filename}
+4. Create IngestionJob record (status: "pending")
+5. Process: parse → chunk → embed → store in Chroma
+6. Create KnowledgeDocument record
+7. Update IngestionJob (status: "completed")
+8. Return UploadResponse
+```
+
+Processing happens synchronously in the request (for simplicity). Large files may cause longer response times — acceptable for academic scope.
 
 ---
 
 ## 31.3 Upload Response
-``` Python
+
+```python
 class UploadResponse(BaseModel):
-    document_id: str
-    file_name: str
-    chunk_count: int
-    status: str
+    document_id: str       # UUID4
+    file_name: str         # original file name
+    chunk_count: int       # number of chunks created
+    status: str            # "completed"
 ```
 
 ---
 
+## 31.4 File Validation
+
+- Enforce file extensions: `.pdf`, `.md`, `.txt`
+- Reject with 400 if type not supported
+- Max file size: not enforced (academic scope)
+
+---
+
 # 32. Health API
+
 ## 32.1 Endpoint
-``` http
+
+```http
 GET /api/health
 ```
 
 ## 32.2 Response
-``` Python
+
+```python
 class HealthResponse(BaseModel):
-    status: str
-    database: str
-    vectorstore: str
-    llm_provider: str
+    status: str              # "healthy" | "degraded" | "unhealthy"
+    database: str            # "connected" | "disconnected"
+    vectorstore: str         # "connected" | "disconnected"
+    llm_provider: str        # "miniMax" | "openai" | "mock" | "unavailable"
 ```
 
 ---
 
 # 33. SQLAlchemy Model Design
+
 ## 33.1 Session Model
-``` Python
+
+```python
 class ChatSession(Base):
     __tablename__ = "chat_sessions"
 
-    id = Column(String, primary_key=True)
-
-    title = Column(String, nullable=False)
-
-    created_at = Column(DateTime, nullable=False)
-
-    updated_at = Column(DateTime, nullable=False)
+    id = Column(String, primary_key=True)            # UUID4
+    title = Column(String, nullable=False, default="New Chat")
+    created_at = Column(String, nullable=False)      # UTC ISO 8601
+    updated_at = Column(String, nullable=False)      # UTC ISO 8601
 ```
 
 ---
 
 ## 33.2 Message Model
-``` Python
+
+```python
 class ChatMessage(Base):
     __tablename__ = "chat_messages"
 
-    id = Column(String, primary_key=True)
-
-    session_id = Column(
-        String,
-        ForeignKey("chat_sessions.id")
-    )
-
-    role = Column(String, nullable=False)
-
+    id = Column(String, primary_key=True)            # UUID4
+    session_id = Column(String, ForeignKey("chat_sessions.id"), nullable=False)
+    role = Column(String, nullable=False)            # "user" | "assistant"
     content = Column(Text, nullable=False)
-
-    metadata_json = Column(Text)
-
-    created_at = Column(DateTime, nullable=False)
+    metadata_json = Column(Text)                     # JSON string: structured_data + citations
+    created_at = Column(String, nullable=False)      # UTC ISO 8601
 ```
 
+---
+
+## 33.3 Knowledge Document Model
+
+```python
+class KnowledgeDocument(Base):
+    __tablename__ = "knowledge_documents"
+
+    id = Column(String, primary_key=True)
+    title = Column(String, nullable=False)
+    source = Column(String, nullable=False)
+    chunk_count = Column(Integer, nullable=False)
+    created_at = Column(String, nullable=False)
+```
+
+---
+
+## 33.4 Ingestion Job Model
+
+```python
+class IngestionJob(Base):
+    __tablename__ = "ingestion_jobs"
+
+    id = Column(String, primary_key=True)
+    file_name = Column(String, nullable=False)
+    status = Column(String, nullable=False)          # "pending" | "processing" | "completed" | "failed"
+    error_message = Column(String)
+    created_at = Column(String, nullable=False)
+```
+
+---
 
 # 34. LangGraph Builder Design
+
 ## 34.1 Graph Builder
-File:
-`graph/builder.py`
+
+File: `graph/builder.py`
 
 Responsible for:
-- creating graph
-- registering nodes
-- registering edges
+- creating StateGraph
+- registering all nodes
+- registering conditional edges
 - compiling graph
 
 ---
 
 ## 34.2 Node Registration
-``` Python
-graph.add_node("intent", intent_node)
 
-graph.add_node("market", market_node)
+```python
+workflow = StateGraph(GraphState)
 
-graph.add_node("retrieval", retrieval_node)
+# Nodes
+workflow.add_node("intent", intent_node)
+workflow.add_node("market_data", market_node)        # Yahoo Finance + normalize
+workflow.add_node("news", news_node)                  # Tavily search
+workflow.add_node("retrieval", retrieval_node)        # Chroma similarity search
+workflow.add_node("rerank", rerank_node)              # LLM rerank
+workflow.add_node("merge", merge_node)                # Combine market + RAG context (hybrid only)
+workflow.add_node("generation", generation_node)      # LLM response generation
+workflow.add_node("formatter", formatter_node)        # Normalize structured_data + citations
+workflow.add_node("rejection", rejection_node)        # Friendly rejection for unsupported
 
-graph.add_node("rerank", rerank_node)
+# Entry
+workflow.set_entry_point("intent")
 
-graph.add_node("generation", generation_node)
+# After intent: route to first node based on intent
+workflow.add_conditional_edges(
+    "intent",
+    route_by_intent,
+    {
+        "market": "market_data",       # market flow
+        "rag": "retrieval",            # RAG flow
+        "hybrid": "market_data",       # hybrid starts with market data, then RAG
+        "unsupported": "rejection",
+    }
+)
 
-graph.add_node("formatter", formatter_node)
+# market_data → news (shared by market and hybrid flows)
+workflow.add_edge("market_data", "news")
+
+# After news: market → generation, hybrid → retrieval (RAG phase)
+workflow.add_conditional_edges(
+    "news",
+    route_after_news,
+    {
+        "market": "generation",
+        "hybrid": "retrieval",
+    }
+)
+
+# retrieval → rerank (shared by rag and hybrid flows)
+workflow.add_edge("retrieval", "rerank")
+
+# After rerank: rag → generation, hybrid → merge
+workflow.add_conditional_edges(
+    "rerank",
+    route_after_rerank,
+    {
+        "rag": "generation",
+        "hybrid": "merge",
+    }
+)
+
+# merge → generation (hybrid only path)
+workflow.add_edge("merge", "generation")
+
+# generation → formatter → END (all flows)
+workflow.add_edge("generation", "formatter")
+workflow.add_edge("formatter", END)
+
+# rejection → END
+workflow.add_edge("rejection", END)
 ```
+
+---
+
+## 34.3 Conditional Routing
+
+```python
+# graph/edges/router.py
+
+def route_by_intent(state: GraphState) -> str:
+    """Route from intent node to first processing node."""
+    intent = state["intent"]
+    if state.get("error"):
+        return "unsupported"
+    if intent == "market":
+        return "market"
+    elif intent == "rag":
+        return "rag"
+    elif intent == "hybrid":
+        return "hybrid"
+    return "unsupported"
+
+
+def route_after_news(state: GraphState) -> str:
+    """After news node: market goes to generation, hybrid continues to RAG phase."""
+    if state.get("error"):
+        return "market"  # will go to generation which skips on error
+    intent = state["intent"]
+    if intent == "hybrid":
+        return "hybrid"
+    return "market"  # market flow → generation
+
+
+def route_after_rerank(state: GraphState) -> str:
+    """After rerank node: rag goes to generation, hybrid goes to merge."""
+    if state.get("error"):
+        return "rag"  # will go to generation which skips on error
+    intent = state["intent"]
+    if intent == "hybrid":
+        return "hybrid"
+    return "rag"  # rag flow → generation
+```
+
+**Fail-fast in nodes**: Each node checks `if state.get("error"): return state` at the start and skips all work if an error is already present. This ensures errors propagate through the graph without further processing.
 
 ---
 
 # 35. Intent Router Logic
+
 ## 35.1 Router Categories
-Supported intents:
-``` 
-market
-rag
-hybrid
-unsupported
+
+Supported intents (LLM-classified):
+
+```text
+market       — queries about stock prices, market data, asset metrics
+rag          — queries about financial concepts, definitions, knowledge
+hybrid       — queries combining market data + financial concepts
+unsupported  — out-of-scope queries
 ```
 
-## 35.2 Intent Examples
-Market Query: `What is Tesla's current stock price?`
+---
 
-RAG Query: `What is PE ratio?`
+## 35.2 Intent Classification Implementation
 
-Hybrid Query: `Why did Tesla stock rise and what does PE ratio indicate?`
+```python
+# graph/intent_classifier.py
+
+from pydantic import BaseModel
+from typing import Literal
+
+class IntentResult(BaseModel):
+    intent: Literal["market", "rag", "hybrid", "unsupported"]
+    confidence: float
+    reasoning: str
+
+async def classify_intent(
+    query: str,
+    llm_provider,
+    intent_prompt: str,
+) -> IntentResult:
+    structured_llm = llm_provider.get_model().with_structured_output(
+        IntentResult,
+        method="function_calling",
+    )
+    return await structured_llm.ainvoke(intent_prompt + "\n\nUser query: " + query)
+```
+
+---
+
+## 35.3 Intent Examples
+
+| Intent | Example Query |
+|---|---|
+| market | "What is Tesla's current stock price?" |
+| market | "Show me AAPL's market cap and PE ratio" |
+| rag | "What is PE ratio?" |
+| rag | "Explain discounted cash flow valuation" |
+| hybrid | "Why did Tesla stock fall recently and what does its PE ratio imply?" |
+| hybrid | "NVIDIA's valuation seems high — explain using its current PE" |
+| unsupported | "Write me a poem about the stock market" |
+| unsupported | "Tell me a joke" |
 
 ---
 
 # 36. Tool Layer Specification
+
 ## 36.1 Market Data Tool
+
 File: `tools/market_data_tool.py`
 
 Responsibilities:
-- fetch stock price
-- fetch historical data
-- fetch market metrics
-- normalize market output
+- fetch real-time stock price via `yfinance.Ticker(symbol).info`
+- fetch historical data via `yfinance.Ticker(symbol).history(period="30d")`
+- normalize output to standard dict format
+- cache results with `TTLCache(maxsize=128, ttl=60)`
+
+Typed interface:
+
+```python
+async def fetch_market_data(symbol: str) -> dict:
+    """Returns normalized market data or raises MarketDataError."""
+```
 
 ---
 
 ## 36.2 Tavily Search Tool
+
+File: `tools/tavily_search_tool.py`
+
 Responsibilities:
-- search financial news
-- retrieve related articles
+- search financial news: query = f"{ticker} stock news"
+- return top 5 results with title, url, snippet, published date
 - provide citation URLs
 
 ---
 
-## 36.3 Retrieval Tool
+## 36.3 Tavily Extract Tool
+
+File: `tools/tavily_extract_tool.py`
+
 Responsibilities:
-- similarity search
-- top-k retrieval
-- metadata filtering
+- extract full article text from URLs returned by Tavily Search
+- return clean text content for LLM context
 
 ---
 
-## 36.4 Rerank Tool
+## 36.4 Retrieval Tool
+
+File: `tools/retrieval_tool.py`
+
 Responsibilities:
-- lightweight reranking
-- chunk selection
-- context prioritization
+- embed user query using BAAI/bge-small-en-v1.5
+- similarity search in Chroma (top-k=8)
+- return chunks with metadata (document_id, document_name, chunk_index)
+
+---
+
+## 36.5 Rerank Tool
+
+File: `tools/rerank_tool.py`
+
+Responsibilities:
+- take top-8 chunks + user query
+- LLM evaluates relevance of each chunk
+- select top-4 most relevant chunks
+- return ordered list of chunks (most relevant first)
+
+Rerank prompt approach: present all 8 chunks with IDs, ask LLM to select the 4 most relevant ones by ID.
+
+---
+
+## 36.6 Embedding Tool
+
+File: `tools/embedding_tool.py`
+
+Responsibilities:
+- load BAAI/bge-small-en-v1.5 model (lazy, once)
+- embed single text or batch
+- return normalized embedding vectors
+
+---
+
+## 36.7 LLM Tool
+
+File: `tools/llm_tool.py`
+
+Responsibilities:
+- read LLM configuration from `config/settings.py`
+- instantiate provider (OpenAI-compatible client with MiniMax base_url)
+- wrap `model.with_structured_output(schema, method="function_calling")` for structured extraction
+- provide streaming and non-streaming chat methods
 
 ---
 
 # 37. LLM Provider Abstraction
+
 ## 37.1 Design Goal
 
-The project must support: any OpenAI-compatible API
+The project must support any OpenAI-compatible API.
 
 ---
 
 ## 37.2 Base Provider Interface
-``` Python
+
+```python
+from abc import ABC, abstractmethod
+
 class BaseLLMProvider(ABC):
 
     @abstractmethod
-    async def chat(
-        self,
-        messages: list,
-        stream: bool = False
-    ):
+    def get_model(self):
+        """Return underlying model (e.g. ChatOpenAI instance)."""
+        pass
+
+    @abstractmethod
+    async def chat(self, messages: list[dict], stream: bool = False):
+        """Chat completion. Returns string or async iterator of tokens."""
+        pass
+
+    @abstractmethod
+    def with_structured_output(self, schema, method: str = "function_calling"):
+        """Return a runnable that outputs structured data via function_calling."""
         pass
 ```
 
+---
+
 ## 37.3 Supported Providers
+
 Initial implementations:
-- OpenAI
-- OpenRouter
-- Mock Provider
+- **OpenAICompatibleProvider** (covers OpenAI, MiniMax, DeepSeek, OpenRouter — any `/v1/chat/completions` endpoint)
+- **MockProvider** (for automated testing without real API keys)
+
+The choice of provider is driven entirely by `.env`:
+
+```
+# For MiniMax:
+LLM_API_KEY=sk-cp-...
+LLM_BASE_URL=https://api.minimaxi.com/v1
+LLM_MODEL=MiniMax-M2.7
+
+# For OpenAI (just change env vars):
+LLM_API_KEY=sk-...
+LLM_BASE_URL=https://api.openai.com/v1
+LLM_MODEL=gpt-4o
+```
 
 ---
 
 # 38. Prompt Engineering Architecture
+
 ## 38.1 Prompt Directory
-```
+
+```text
 prompts/
-├── system/
-├── market/
-├── rag/
-├── rerank/
-└── formatting/
+├── system/          # Main system prompt
+├── market/          # Market analysis prompts
+├── rag/             # RAG generation + rerank prompts
+├── rerank/          # Rerank selection prompts
+├── formatting/      # Structured output formatting prompts
+├── intent/          # Intent classification prompt
+├── rejection/       # Unsupported query rejection prompt
+└── title/           # Session title generation prompt
 ```
 
 ---
-## 38.2 Prompt Separation Strategy
+
+## 38.2 Prompt File Format
+
+All prompts stored as `.txt` files with optional `{placeholder}` template variables.
+
+Example `prompts/intent/intent_classifier.txt`:
+
+```text
+You are an intent classifier for a financial QA system.
+Classify the user's query into one of four categories:
+
+- market: queries about stock prices, market data, specific asset metrics
+- rag: queries about financial concepts, definitions, terminology, theory
+- hybrid: queries that combine market data questions with financial concept questions
+- unsupported: queries completely unrelated to finance or investing
+
+Examples:
+- "What is Tesla's stock price?" → market
+- "What is PE ratio?" → rag
+- "Why did Tesla stock fall and what does PE ratio mean?" → hybrid
+- "Write me a poem" → unsupported
+
+User query: {user_query}
+```
+
+Prompt files are loaded at startup/import time via a simple `load_prompt(path)` utility that reads the file contents.
+
+---
+
+## 38.3 Prompt Separation Strategy
+
 Different prompts are isolated by responsibility.
 
 Reasoning:
-- maintainability
-- testability
-- prompt iteration
-- debugging
+- maintainability (change one prompt without touching others)
+- testability (test prompts independently)
+- prompt iteration (rapid improvement cycle)
+- debugging (isolate which prompt caused an issue)
 
 ---
 
 # 39. System Prompt Specification
+
 ## 39.1 System Prompt Goals
 
 The assistant must:
 - separate facts from analysis
-- avoid hallucination
-- cite sources
-- avoid price prediction
-- acknowledge uncertainty
+- avoid hallucination (cite sources or acknowledge uncertainty)
+- cite sources for all data claims
+- avoid price prediction (no "will go up/down")
+- acknowledge uncertainty when data is incomplete
 
 ---
 
 ## 39.2 Required Behaviors
 
 The system prompt must explicitly enforce:
+
+```text
+objective market data ≠ analytical interpretation
 ```
-objective market data
-≠
-analytical interpretation
-```
+
+Market data is presented as-is. Any interpretation must be clearly labeled as analysis.
+
+---
 
 ## 39.3 Forbidden Behaviors
 
 The assistant must NOT:
 - fabricate market prices
 - predict future stock movements
-- invent citations
+- invent citations or sources
 - claim unsupported financial conclusions
+- give investment advice
 
 ---
 
 # 40. Market Analysis Prompt Rules
+
 ## 40.1 Required Structure
 
 Market responses should contain:
-1. Current Market Data
-2. Trend Summary
-3. Potential Influencing Factors
-4. Risk / Uncertainty
+
+1. **Current Market Data** — price, change, key metrics (from actual data)
+2. **Trend Summary** — 7-day and 30-day trend description (from historical data)
+3. **Potential Influencing Factors** — related news (from Tavily, cited)
+4. **Risk / Uncertainty** — acknowledge what the data cannot tell us
 
 ---
 
@@ -1692,20 +2367,22 @@ Market responses should contain:
 
 Analysis must:
 
-- remain probabilistic
+- remain probabilistic ("may suggest", "could indicate", NOT "will lead to")
 - avoid certainty language
-- distinguish news from inference
+- distinguish news facts from AI inference
+- always cite the source of news claims
 
 ---
 
 # 41. RAG Prompt Rules
+
 ## 41.1 RAG Grounding
 
 RAG responses must:
 
-- prioritize retrieved context
-- avoid unsupported expansion
-- cite retrieved documents
+- prioritize retrieved context over model's own knowledge
+- avoid unsupported expansion beyond retrieved documents
+- cite retrieved documents by name
 
 ---
 
@@ -1713,261 +2390,456 @@ RAG responses must:
 
 Every RAG response should include:
 
+```text
 Sources:
-- document name
-- chunk reference
+- [document_name], chunk [chunk_index]
+```
 
 ---
 
 # 42. Structured Output Rules
+
 ## 42.1 Structured Metadata Schema
-``` json
+
+```json
 {
   "active_asset": "TSLA",
-
   "price": 221.13,
-
+  "change": 5.20,
   "change_pct": 2.4,
-
   "trend": "bullish",
-
   "market_metrics": {
-    "market_cap": "...",
-    "pe_ratio": "...",
-    "volume": "..."
+    "market_cap": "692.5B",
+    "pe_ratio": 62.3,
+    "volume": "58.2M"
+  },
+  "chart_data": {
+    "7d": [
+      {"date": "2026-05-05", "close": 218.50},
+      {"date": "2026-05-06", "close": 220.10}
+    ],
+    "30d": [
+      {"date": "2026-04-12", "close": 205.30}
+    ]
   }
 }
 ```
 
-## 42.2 Structured Data Rules
+---
+
+## 42.2 Structured Data Implementation
+
+Structured data is extracted from LLM output via `with_structured_output`:
+
+```python
+class StructuredData(BaseModel):
+    active_asset: str | None = None
+    price: float | None = None
+    change: float | None = None
+    change_pct: float | None = None
+    trend: str | None = None
+    market_metrics: dict | None = None
+    chart_data: dict | None = None
+
+structured_llm = model.with_structured_output(
+    StructuredData,
+    method="function_calling",
+)
+```
+
+---
+
+## 42.3 Structured Data Rules
 
 Structured data must:
 
-- remain deterministic
-- use normalized keys
-- avoid markdown formatting
+- remain deterministic (same input → same structure)
+- use normalized keys (snake_case in backend, camelCase in frontend)
+- avoid markdown formatting (pure JSON values)
+- be JSON serializable (no dates, sets, or complex objects)
+
+---
+
+## 42.4 Citations Schema
+
+```python
+class Citation(BaseModel):
+    title: str
+    url: str = ""
+    source_type: Literal["web", "rag", "yahoo_finance"]
+```
+
+Citations are extracted via `with_structured_output` during the generation phase (included in the same structured output call).
 
 ---
 
 # 43. Streaming Service Design
+
 ## 43.1 Streaming Responsibilities
 
 Streaming service manages:
 
-- SSE lifecycle
-- event formatting
-- connection cleanup
-- stream termination
+- SSE lifecycle (open → events → close)
+- event formatting (`event: ...\ndata: ...\n\n`)
+- connection cleanup (on disconnect or error)
+- stream termination (send `done` or `error`, then close)
 
 ---
 
 ## 43.2 Streaming Flow
-```
-LLM token
+
+```text
+Graph execution starts
     ↓
-SSE event
+SSE connection opened (text/event-stream)
     ↓
-Frontend incremental rendering
+LLM generates tokens
+    ↓ Each token
+SSE "token" event sent
+    ↓
+Frontend incrementally renders markdown
+    ↓
+LLM generation complete
+    ↓
+Structured data extracted
+    ↓
+SSE "structured_data" event sent
+    ↓
+SSE "citations" event sent
+    ↓
+SSE "done" event sent
+    ↓
+SSE connection closed
 ```
+
 ---
 
 # 44. Frontend Streaming Strategy
+
 ## 44.1 Streaming Method
-Frontend uses: fetch + ReadableStream
 
-NOT: EventSource
+Frontend uses: `fetch` + `ReadableStream`
 
-## 44.2 Reasoning
+NOT: `EventSource`
 
-Advantages:
+Reasoning:
 
-- supports POST requests
-- supports auth expansion
-- supports cancellation
-- easier future extensibility
+- `fetch` supports POST requests (required for /api/chat)
+- supports custom headers (future auth expansion)
+- supports cancellation via `AbortController`
+- more flexible than `EventSource` (which only supports GET)
+
+---
+
+## 44.2 SSE Client Implementation
+
+```typescript
+// services/sse/sseClient.ts
+async function* streamChat(body: ChatRequest): AsyncGenerator<SSEEvent> {
+  const response = await fetch("/api/chat", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Accept": "text/event-stream" },
+    body: JSON.stringify(body),
+  });
+
+  const reader = response.body!.getReader();
+  const decoder = new TextDecoder();
+
+  let buffer = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    // Parse complete SSE events from buffer
+    const events = parseSSEBuffer(buffer);
+    for (const event of events) yield event;
+  }
+}
+```
 
 ---
 
 # 45. Frontend Component Design
+
 ## 45.1 Chat Components
-```
+
+```text
 components/chat/
-├── ChatContainer.tsx
-├── ChatMessage.tsx
-├── ChatInput.tsx
-├── StreamingMessage.tsx
-└── CitationList.tsx
+├── ChatContainer.tsx       # Scrollable message list + input
+├── ChatMessage.tsx          # Rendered message (markdown)
+├── ChatInput.tsx            # Textarea + send button, handles Enter
+├── StreamingMessage.tsx     # Real-time token accumulation display
+└── CitationList.tsx         # Clickable citation links at end of message
 ```
 
 ---
 
 ## 45.2 Market Components
-```
+
+```text
 components/market/
-├── MarketPanel.tsx
-├── PriceCard.tsx
-├── TrendChart.tsx
-├── MetricsCard.tsx
-└── NewsPanel.tsx
+├── MarketPanel.tsx          # Right panel, shows empty state or market data
+├── PriceCard.tsx            # Large price display + change badge (green/red)
+├── TrendChart.tsx           # Recharts <LineChart>, toggle 7d/30d
+└── MetricsCard.tsx          # Grid of PE ratio, market cap, volume
 ```
 
 ---
 
 ## 45.3 Sidebar Components
-```
+
+```text
 components/sidebar/
-├── SessionList.tsx
-├── SessionItem.tsx
-└── NewChatButton.tsx
+├── Sidebar.tsx              # Left panel wrapper
+├── SessionList.tsx          # Scrollable list
+├── SessionItem.tsx          # Title + date + active highlight
+└── NewChatButton.tsx        # "+" button, creates session, navigates
+```
+
+---
+
+## 45.4 Component Hierarchy
+
+```text
+layout.tsx
+├── ThemeProvider (next-themes)
+├── QueryClientProvider (TanStack Query)
+└── page.tsx
+    ├── Sidebar
+    │   ├── NewChatButton
+    │   └── SessionList
+    │       └── SessionItem[]
+    ├── ChatContainer
+    │   ├── ChatMessage[] / StreamingMessage
+    │   ├── CitationList
+    │   └── ChatInput
+    └── MarketPanel
+        ├── PriceCard
+        ├── TrendChart
+        └── MetricsCard
 ```
 
 ---
 
 # 46. State Management Rules
+
 ## 46.1 Zustand Rules
 
-Zustand stores ONLY UI state.
+Zustand stores ONLY UI state. Never server cache.
 
 Examples:
-
-- selected session
-- sidebar collapse
-- loading state
+- `activeSessionId: string | null`
+- `sidebarOpen: boolean`
+- `isStreaming: boolean`
+- `streamingTokens: string`
+- `theme: "light" | "dark" | "system"`
 
 ---
 
 ## 46.2 TanStack Query Rules
 
-TanStack Query manages ONLY server state.
+TanStack Query manages ONLY server state. Never UI state.
 
 Examples:
-
-- sessions API
-- chat history
-- market data
+- `useQuery({ queryKey: ["sessions"], queryFn: fetchSessions })`
+- `useMutation({ mutationFn: createSession, onSuccess: invalidateQueries })`
+- `useQuery({ queryKey: ["session", id], queryFn: () => fetchSession(id) })`
 
 ---
 
 # 47. Markdown Rendering Rules
+
 ## 47.1 Markdown Features
 
 The renderer must support:
 
-- GitHub markdown
-- tables
-- inline code
-- syntax highlight
+- GitHub Flavored Markdown (tables, task lists, strikethrough)
+- headings (H1-H6)
+- inline code and code blocks with syntax highlighting
+- links (open in new tab)
+- blockquotes
 
 ---
 
 ## 47.2 Security Rules
 
-Markdown rendering must:
-
-- sanitize HTML
-- disable unsafe raw HTML
+- Sanitize HTML: no raw HTML passthrough
+- Use `rehype-sanitize` or equivalent
+- All links: `target="_blank" rel="noopener noreferrer"`
 
 ---
 
 # 48. Market Panel Behavior
+
 ## 48.1 Panel Update Trigger
 
-The market panel updates when: `structured_data.active_asset` changes.
+The market panel updates when a SSE `structured_data` event contains `active_asset`.
 
 ---
 
 ## 48.2 Default Empty State
 
-Default state: `No asset selected`
+```text
+"No active asset"
+"Ask a market question to see data here"
+```
+
+---
+
+## 48.3 Price Color Coding
+
+- Positive change: green
+- Negative change: red
+- No change: neutral gray
 
 ---
 
 # 49. Chart Design
+
 ## 49.1 Chart Types
 
-Charts include:
-
-- 7-day line chart
-- 30-day line chart
+- 7-day line chart (default view)
+- 30-day line chart (toggle button)
 
 ---
 
 ## 49.2 Chart Source
 
-Charts use: Yahoo Finance historical data
+Charts use `structured_data.chart_data` from backend (Yahoo Finance historical data, normalized).
 
 ---
 
 # 50. Error Handling Specification
+
 ## 50.1 Fail-Fast Policy
 
-No graceful fallback logic.
-
-Errors must propagate explicitly.
+No graceful fallback logic. Errors propagate explicitly.
 
 ---
 
 ## 50.2 Error Categories
 
-| Error Type         | Behavior         |
-| ------------------ | ---------------- |
-| LLM Failure        | return error     |
-| Market API Failure | return error     |
-| Retrieval Failure  | return error     |
-| SSE Failure        | terminate stream |
+| Error Type | Behavior |
+|---|---|
+| LLM Failure | SSE error event, terminate stream |
+| Market API Failure | SSE error event, terminate stream |
+| Retrieval Failure | SSE error event, terminate stream |
+| Upload Failure | JSON error response (400/500) |
+| SSE Failure | terminate stream, frontend shows error |
 
 ---
 
-## 50.3 Frontend Error UX
-Frontend displays:
+## 50.3 Error Format (Unified)
 
-- toast notification
-- failed message state
-- retry button
+All errors use the same structure:
+
+```json
+{
+  "error": {
+    "type": "MarketAPIError",
+    "message": "Failed to retrieve market data for TSLA"
+  }
+}
+```
+
+GraphState stores error as `Optional[dict]`:
+
+```python
+{
+    "type": "MarketAPIError",
+    "message": "Failed to retrieve market data for TSLA"
+}
+```
+
+---
+
+## 50.4 Frontend Error UX
+
+Frontend displays errors via:
+- Toast notification (using `sonner`)
+- Failed message state (inline error in chat)
+- Retry button (re-sends last user query)
 
 ---
 
 # 51. Logging Architecture
+
 ## 51.1 Required Logs
 
 The system must log:
 
-- incoming requests
-- graph routing
-- node execution
-- retrieval latency
-- market API latency
-- SSE lifecycle
+- incoming requests (method, path, session_id)
+- graph routing (intent: {intent}, confidence: {confidence})
+- node execution (node: {name}, duration_ms)
+- retrieval latency (k: {k}, duration_ms)
+- market API latency (symbol: {symbol}, duration_ms)
+- SSE lifecycle (events_sent, duration_ms)
+- API failures (error_type, error_message, traceback)
 
 ---
 
 ## 51.2 Log Format
 
-Preferred format: structured logs
+```text
+[2026-05-12T10:30:00] [INFO] [graph.router] Intent classified: market (confidence=0.95)
+[2026-05-12T10:30:02] [INFO] [tools.market] Fetched market data for TSLA in 1200ms
+[2026-05-12T10:30:05] [ERROR] [api.chat] SSE stream terminated: MarketAPIError - ...
+```
 
 ---
 
 # 52. Configuration Management
+
 ## 52.1 Environment Variables
-```
-OPENAI_API_KEY=
-OPENAI_BASE_URL=
-TAVILY_API_KEY=
 
-SQLITE_PATH=
-CHROMA_PATH=
+```text
+# .env file at project root
 
-EMBEDDING_MODEL=
+# LLM Provider (MiniMax by default)
+MINIMAX_API_KEY=sk-cp-...
+MINIMAX_BASE_URL=https://api.minimaxi.com/v1
+MINIMAX_MODEL=MiniMax-M2.7
+
+# Tavily Search
+TAVILY_API_KEY=tvly-dev-...
+
+# Database paths (optional, defaults below)
+SQLITE_PATH=./backend/data/sqlite.db
+CHROMA_PATH=./backend/chroma_db/
+
+# Embedding model (optional)
+EMBEDDING_MODEL=BAAI/bge-small-en-v1.5
 ```
 
 ---
 
 ## 52.2 Settings Management
-Centralized under: `config/settings.py`
+
+Centralized under: `config/settings.py` using Pydantic `BaseSettings`:
+
+```python
+from pydantic_settings import BaseSettings
+
+class Settings(BaseSettings):
+    minimax_api_key: str
+    minimax_base_url: str = "https://api.minimaxi.com/v1"
+    minimax_model: str = "MiniMax-M2.7"
+    tavily_api_key: str
+    sqlite_path: str = "./backend/data/sqlite.db"
+    chroma_path: str = "./backend/chroma_db/"
+    embedding_model: str = "BAAI/bge-small-en-v1.5"
+
+    class Config:
+        env_file = ".env"
+
+settings = Settings()
+```
 
 ---
 
 # 53. Local Development Workflow
+
 ## 53.1 Startup Command
 
 Single startup entry: `start_project.bat`
@@ -1978,14 +2850,16 @@ Single startup entry: `start_project.bat`
 
 The script should:
 
-- activate environments
-- start backend
-- start frontend
-- open separate terminals
+1. Check Python venv exists, create if not → `python -m venv venv`
+2. Install backend deps → `pip install -r backend/requirements.txt`
+3. Install frontend deps → `cd frontend && npm install`
+4. Start FastAPI server on port 8000 in a new terminal
+5. Start Next.js dev server on port 3000 in a new terminal
 
 ---
 
 # 54. AI Coding Agent Rules
+
 ## 54.1 Mandatory Constraints
 
 AI coding agents MUST:
@@ -1993,8 +2867,9 @@ AI coding agents MUST:
 - follow file structure exactly
 - avoid architectural changes
 - maintain strict typing
-- preserve repository pattern
-- preserve tool isolation
+- preserve repository pattern (graph nodes → tools, NOT graph nodes → API directly)
+- preserve tool isolation (tools are stateless, typed, independently testable)
+- use `with_structured_output(schema, method="function_calling")` for all structured output
 
 ---
 
@@ -2002,15 +2877,19 @@ AI coding agents MUST:
 
 AI coding agents must NOT:
 
-- merge layers
+- merge layers (e.g., business logic inside API routes)
 - place business logic in routes
-- bypass repositories
-- directly call APIs inside graph nodes
+- bypass repositories (graph nodes accessing DB directly)
+- directly call external APIs inside graph nodes (must go through tools)
+- use untyped state or raw dicts
+- hardcode model names or API keys
 
 ---
 
 # 55. Engineering Priorities
+
 ## 55.1 Priority Order
+
 1. correctness
 2. architecture clarity
 3. maintainability
@@ -2019,7 +2898,7 @@ AI coding agents must NOT:
 
 ---
 
-# SPD.md — Financial Asset QA System
+# TSD.md — Financial Asset QA System
 # Part 3 — Testing, Implementation Roadmap, Coding Standards, Acceptance Criteria, and AI-Agent Execution Instructions
 
 ---
@@ -2049,13 +2928,13 @@ The testing system must validate:
 
 | Area | Goal |
 |---|---|
-| LangGraph routing | correct intent flow |
-| Tool execution | correct API integration |
-| Database operations | correct persistence |
-| SSE streaming | stable incremental delivery |
-| RAG pipeline | correct retrieval behavior |
+| LangGraph routing | correct intent flow for all 4 intents |
+| Tool execution | correct API integration + normalization |
+| Database operations | correct CRUD + transaction behavior |
+| SSE streaming | stable incremental delivery + correct events |
+| RAG pipeline | correct retrieval + rerank behavior |
 | Session persistence | correct history reconstruction |
-| Frontend integration | correct end-to-end behavior |
+| Frontend integration | correct end-to-end behavior via Playwright |
 
 ---
 
@@ -2066,7 +2945,23 @@ The testing system must validate:
 | Backend overall | 70% - 80% |
 | Critical services | 80%+ |
 | Frontend unit testing | not required |
-| E2E critical flows | mandatory |
+| E2E critical flows | mandatory (10 flows) |
+
+---
+
+## 56.4 Testing Order
+
+```text
+Full implementation completed
+    ↓
+Write and run all tests
+    ↓
+Fix failures
+    ↓
+Re-run all tests
+    ↓
+All green (passing)
+```
 
 ---
 
@@ -2078,14 +2973,35 @@ The testing system must validate:
 tests/
 ├── unit/
 │   ├── graph/
+│   │   ├── test_intent_node.py
+│   │   ├── test_market_node.py
+│   │   ├── test_retrieval_node.py
+│   │   ├── test_rerank_node.py
+│   │   ├── test_generation_node.py
+│   │   └── test_formatter_node.py
 │   ├── tools/
+│   │   ├── test_market_data_tool.py
+│   │   ├── test_tavily_search_tool.py
+│   │   ├── test_retrieval_tool.py
+│   │   └── test_embedding_tool.py
 │   ├── repositories/
+│   │   ├── test_session_repository.py
+│   │   ├── test_message_repository.py
+│   │   └── test_document_repository.py
 │   └── services/
+│       ├── test_session_service.py
+│       └── test_rag_service.py
 │
 ├── integration/
 │   ├── rag/
+│   │   └── test_rag_pipeline.py
 │   ├── market/
+│   │   └── test_market_integration.py
 │   └── graph/
+│       ├── test_market_flow.py
+│       ├── test_rag_flow.py
+│       ├── test_hybrid_flow.py
+│       └── test_unsupported_flow.py
 │
 ├── api/
 │   ├── test_chat_api.py
@@ -2097,9 +3013,13 @@ tests/
 │   └── playwright/
 │
 ├── fixtures/
+│   ├── documents/                 # test .md, .txt, .pdf files
+│   ├── market_data/               # mock Yahoo Finance responses
+│   ├── sessions/                  # pre-built session states
+│   └── graph_states/              # sample GraphState dicts
 │
-├── conftest.py
-└── pytest.ini
+├── conftest.py                    # shared fixtures, test DB setup, mock provider
+└── pytest.ini                     # pytest config
 ```
 
 ---
@@ -2108,13 +3028,13 @@ tests/
 
 ## 58.1 Unit Testing Scope
 
-Unit tests should cover:
+Unit tests cover:
 
-- repositories
-- graph nodes
-- tools
+- repositories (with in-memory SQLite)
+- graph nodes (with mock tools)
+- tools (with mock API responses)
+- services (with mock repositories)
 - utility functions
-- services
 
 ---
 
@@ -2122,9 +3042,11 @@ Unit tests should cover:
 
 Repositories must test:
 
-- CRUD correctness
-- transaction correctness
-- invalid query handling
+- CRUD correctness (create, read, update, delete)
+- invalid query handling (missing session, duplicate ID)
+- transaction isolation
+
+Use in-memory SQLite for repository tests.
 
 ---
 
@@ -2132,19 +3054,21 @@ Repositories must test:
 
 Tools must test:
 
-- API normalization
-- invalid symbol handling
-- response parsing
+- API normalization (raw response → standardized dict)
+- invalid symbol handling (e.g., "ZZZZZZ")
+- response parsing correctness
+
+Use mock API responses (httpx mock or manual fixture).
 
 ---
 
 ## 58.4 Graph Node Testing
 
-Graph node tests must validate:
+Graph node tests validate:
 
-- state transition correctness
-- expected output fields
-- failure propagation
+- state transition correctness (input state → output state)
+- expected output fields present
+- failure propagation (error set in state)
 
 ---
 
@@ -2154,10 +3078,10 @@ Graph node tests must validate:
 
 Integration tests validate:
 
-- graph orchestration
-- retrieval pipeline
-- database integration
-- streaming pipeline
+- full graph orchestration (nodes + edges working together)
+- RAG pipeline (ingestion → retrieval → rerank)
+- database integration (real SQLite, real Chroma)
+- streaming pipeline (SSE event correctness)
 
 ---
 
@@ -2165,9 +3089,9 @@ Integration tests validate:
 
 Validate:
 
-- Yahoo Finance retrieval
-- normalization logic
-- market metric extraction
+- Yahoo Finance data retrieval (real API)
+- normalization logic (data format correctness)
+- market metric extraction (PE ratio, market cap, volume)
 
 ---
 
@@ -2175,10 +3099,10 @@ Validate:
 
 Validate:
 
-- embedding creation
-- Chroma insertion
-- retrieval quality
-- rerank execution
+- embedding creation (correct dimensions)
+- Chroma insertion (data persists)
+- retrieval quality (relevant chunks returned)
+- rerank execution (correct chunk selection)
 
 ---
 
@@ -2189,7 +3113,7 @@ Validate:
 ```text
 pytest
 pytest-asyncio
-httpx
+httpx (AsyncClient against FastAPI test client)
 ```
 
 ---
@@ -2198,10 +3122,11 @@ httpx
 
 Every endpoint must validate:
 
-- success response
-- invalid request handling
-- schema correctness
-- status code correctness
+- success response (200/201)
+- response schema correctness (Pydantic validation)
+- invalid request handling (400)
+- not found handling (404)
+- error response format
 
 ---
 
@@ -2209,14 +3134,13 @@ Every endpoint must validate:
 
 Required tests:
 
-```text
-- send normal query
-- send market query
-- send rag query
+- send normal query (non-streaming)
+- send market query (streaming, verify events)
+- send RAG query (streaming, verify events)
 - send hybrid query
-- invalid payload
-- streaming response
-```
+- send unsupported query (verify rejection)
+- invalid payload (missing session_id)
+- verify SSE events order: token* → structured_data → citations → done
 
 ---
 
@@ -2224,12 +3148,11 @@ Required tests:
 
 Required tests:
 
-```text
-- create session
-- load session
-- list sessions
-- delete session
-```
+- create session (verify default title, UUID4)
+- load session (verify messages included)
+- list sessions (verify ordered by updated_at desc)
+- delete session (verify 204, verify cascade deletes messages)
+- load non-existent session (verify 404)
 
 ---
 
@@ -2237,32 +3160,22 @@ Required tests:
 
 ## 61.1 E2E Goals
 
-Playwright validates:
-
-```text
-real user workflow
-```
-
-instead of isolated frontend logic.
+Playwright validates real user workflows in a real browser.
 
 ---
 
-## 61.2 Playwright Coverage
+## 61.2 Playwright Coverage (10 Mandatory Flows)
 
-Mandatory flows:
-
-```text
-1. open application
-2. create session
-3. ask market question
-4. receive streaming response
-5. switch session
-6. restore history
-7. upload RAG document
-8. ask RAG question
-9. ask hybrid question
-10. verify market panel updates
-```
+1. Open application → 3-panel layout renders
+2. Create new session → appears in sidebar
+3. Ask market question → streaming response renders
+4. Verify market panel updates → price, chart, metrics appear
+5. Ask RAG question (after uploading doc) → citation appears
+6. Ask hybrid question → both market data and citations
+7. Switch session → conversation history restores
+8. Verify history restoration → old messages render correctly
+9. Upload RAG document → success toast appears
+10. Ask unsupported question → friendly rejection message
 
 ---
 
@@ -2291,8 +3204,8 @@ minimal mocking
 
 Reasoning:
 
-- academic projects benefit from real integration
-- easier demonstration
+- academic projects benefit from real integration (more convincing demo)
+- easier demonstration (real data is more compelling)
 - better architecture validation
 
 ---
@@ -2300,21 +3213,19 @@ Reasoning:
 ## 62.2 Allowed Mocking
 
 Allowed:
-
-- mock LLM provider
-- mock Tavily responses
-- mock Yahoo Finance failures
+- Mock LLM provider (for unit tests — avoid real API calls in CI)
+- Mock Tavily responses (for reproducibility)
+- Mock Yahoo Finance failures (for error path testing)
 
 ---
 
 ## 62.3 Forbidden Mocking
 
-Avoid mocking:
-
-- repositories
-- graph routing
-- SSE protocol
-- retrieval pipeline
+Avoid mocking (use real implementations):
+- repositories (use in-memory SQLite instead)
+- graph routing (test the actual compiled graph)
+- SSE protocol (test real streaming)
+- retrieval pipeline (use real Chroma with test data)
 
 ---
 
@@ -2324,10 +3235,15 @@ Avoid mocking:
 
 ```text
 fixtures/
-├── documents/
-├── market_data/
-├── sessions/
-└── graph_states/
+├── documents/           # Test documents for RAG
+│   ├── financial_glossary.md
+│   ├── earnings_summary.txt
+│   └── sample_report.pdf
+├── market_data/         # Cached Yahoo Finance responses
+│   ├── tsla_info.json
+│   └── aapl_history.json
+├── sessions/            # Pre-built session data
+└── graph_states/        # Sample GraphState for node tests
 ```
 
 ---
@@ -2336,9 +3252,9 @@ fixtures/
 
 The repository should include:
 
-- financial glossary markdown
-- earnings summary txt
-- example financial PDF
+- financial glossary markdown (key terms and definitions)
+- earnings summary txt (mock earnings report)
+- example financial PDF (short academic finance paper or mock document)
 
 ---
 
@@ -2348,23 +3264,24 @@ The repository should include:
 
 Streaming tests must validate:
 
-- ordered token delivery
-- stream completion
-- structured event correctness
-- stream termination behavior
+- ordered token delivery (tokens arrive in sequence)
+- stream completion (done event received)
+- structured event correctness (valid JSON in structured_data event)
+- stream termination behavior (error event closes stream)
+- event order: token* → structured_data → citations → done
 
 ---
 
 ## 64.2 Streaming Event Validation
 
-Required events:
+Required events verified:
 
 ```text
-token
-structured_data
-citations
-done
-error
+token              — at least one received
+structured_data    — exactly one, valid JSON
+citations          — exactly one, valid array
+done               — exactly one, stream closes after
+error              — stream terminates immediately
 ```
 
 ---
@@ -2375,22 +3292,22 @@ error
 
 Critical graph behaviors:
 
-- routing correctness
-- state mutation correctness
-- node execution order
-- error propagation
+- routing correctness (intent → correct flow)
+- state mutation correctness (nodes modify state correctly)
+- node execution order (correct for each flow)
+- error propagation (fail-fast: error in state stops further processing)
 
 ---
 
 ## 65.2 Required Graph Tests
 
 ```text
-- market route
-- rag route
-- hybrid route
-- unsupported route
-- rerank execution
-- formatter execution
+- market route: intent="market" → market_node → news_node → generation_node → formatter_node
+- rag route: intent="rag" → retrieval_node → rerank_node → generation_node → formatter_node
+- hybrid route: intent="hybrid" → market_node + retrieval_node in parallel → merge → generation_node → formatter_node
+- unsupported route: intent="unsupported" → rejection_node → END
+- rerank execution: 8 chunks in → 4 chunks out
+- formatter execution: structured_data normalized, citations assembled
 ```
 
 ---
@@ -2399,11 +3316,11 @@ Critical graph behaviors:
 
 ## 66.1 Retrieval Validation
 
-RAG tests should validate:
+RAG tests validate:
 
-- retrieved chunk relevance
-- chunk ordering
-- rerank filtering
+- retrieved chunk relevance (chunks contain query-related terms)
+- chunk count (top-8 returned)
+- chunk metadata completeness (document_id, document_name, chunk_index)
 
 ---
 
@@ -2411,8 +3328,8 @@ RAG tests should validate:
 
 Responses must reference:
 
-- retrieved source
-- document metadata
+- retrieved source document name
+- meaningful chunk reference
 
 ---
 
@@ -2438,10 +3355,10 @@ NOT:
 
 Mandatory:
 
-- Tailwind utility classes
-- shadcn/ui components
-- responsive layout
-- dark mode compatibility
+- Tailwind utility classes (no inline CSS)
+- shadcn/ui components (consistent design system)
+- responsive layout (sidebar collapses on narrow screens)
+- dark mode via `next-themes` + Tailwind `dark:` classes
 
 ---
 
@@ -2449,10 +3366,10 @@ Mandatory:
 
 Avoid:
 
-- inline CSS
-- untyped props
-- oversized global state
-- direct fetch calls inside components
+- inline CSS (`style={{}}` attributes)
+- untyped props (no `any`)
+- oversized global state (keep Zustand stores minimal)
+- direct `fetch` calls inside components (use service layer)
 
 ---
 
@@ -2462,10 +3379,10 @@ Avoid:
 
 Backend must remain:
 
-- layered
-- typed
-- modular
-- deterministic
+- layered (api → graph → tools/services → repositories → database)
+- typed (Python type hints everywhere)
+- modular (each layer importable independently)
+- deterministic (same input → same output)
 
 ---
 
@@ -2473,11 +3390,12 @@ Backend must remain:
 
 Required:
 
-- async endpoints
-- typed schemas
-- repository isolation
-- tool isolation
-- structured logging
+- `async def` for all endpoints and graph nodes
+- Pydantic v2 schemas for all API contracts
+- repository isolation (graph never touches DB directly)
+- tool isolation (graph never calls external APIs directly)
+- structured logging (Python `logging` module)
+- all structured output via `model.with_structured_output(schema, method="function_calling")`
 
 ---
 
@@ -2485,10 +3403,11 @@ Required:
 
 Forbidden:
 
-- business logic inside routes
-- direct DB access inside graph nodes
-- raw SQL inside services
-- untyped responses
+- business logic inside API routes (routes are thin: validate → call service → return)
+- direct DB access inside graph nodes (must go through repositories)
+- raw SQL inside services (must go through repositories)
+- untyped responses (must use Pydantic schemas)
+- hardcoded API keys or model names
 
 ---
 
@@ -2498,9 +3417,9 @@ Forbidden:
 
 Prompts must:
 
-- be modular
-- be explicit
-- minimize hallucination
+- be modular (one file per concern)
+- be explicit (no ambiguity in instructions)
+- minimize hallucination (instruct grounding, citation, uncertainty acknowledgment)
 - enforce structured behavior
 
 ---
@@ -2509,12 +3428,11 @@ Prompts must:
 
 Prompts must explicitly instruct:
 
-```text
 - distinguish facts from analysis
 - avoid unsupported claims
 - avoid future prediction
-- cite uncertainty
-```
+- cite uncertainty when data is incomplete
+- cite sources for all data claims
 
 ---
 
@@ -2524,7 +3442,7 @@ Responses should:
 
 - use concise markdown
 - avoid excessive verbosity
-- maintain financial professionalism
+- maintain financial professionalism (objective tone, no hype)
 
 ---
 
@@ -2532,14 +3450,9 @@ Responses should:
 
 ## 70.1 Provider Compatibility
 
-The system must support:
+The system supports any OpenAI-compatible API by changing `.env`:
 
-```text
-OpenAI-compatible APIs
-```
-
-including:
-
+- MiniMax (default for dev/test — free tier)
 - OpenAI
 - OpenRouter
 - DeepSeek-compatible endpoints
@@ -2548,13 +3461,7 @@ including:
 
 ## 70.2 Model Configuration
 
-Configuration must be externalized:
-
-```text
-.env
-```
-
-NOT hardcoded.
+Configuration externalized to `.env`. No hardcoded values.
 
 ---
 
@@ -2562,9 +3469,28 @@ NOT hardcoded.
 
 Streaming providers must support:
 
-- incremental tokens
+- incremental tokens (not batch-only)
 - async iteration
-- cancellation
+- cancellation (respect `AbortController`)
+
+---
+
+## 70.4 Structured Output Rules
+
+All structured output uses:
+
+```python
+model.with_structured_output(
+    SchemaClass,
+    method="function_calling",
+)
+```
+
+This applies to:
+- Intent classification → `IntentResult`
+- Structured data extraction → `StructuredData`
+- Citations extraction → `list[Citation]`
+- Rerank selection → `RerankSelection`
 
 ---
 
@@ -2573,27 +3499,36 @@ Streaming providers must support:
 ## 71.1 Ingestion Pipeline
 
 ```text
-upload
+POST /api/rag/upload (multipart file)
     ↓
-parse
+Save file to knowledge_base/{uuid}_{filename}
     ↓
-chunk
+Parse file:
+  - .pdf → PyPDFLoader / pdfplumber
+  - .md → raw text
+  - .txt → raw text
     ↓
-embed
+Chunk: RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=150)
     ↓
-store
+Embed: BAAI/bge-small-en-v1.5 (HuggingFaceEmbeddings)
+    ↓
+Store in Chroma (persist mode)
+    ↓
+Create KnowledgeDocument record in SQLite
+    ↓
+Return UploadResponse
 ```
 
 ---
 
 ## 71.2 Chunk Metadata
 
-Every chunk should contain:
+Every chunk stored in Chroma must include:
 
 ```json
 {
-  "document_id": "...",
-  "document_name": "...",
+  "document_id": "550e8400-...",
+  "document_name": "financial_glossary.md",
   "chunk_index": 0
 }
 ```
@@ -2606,7 +3541,7 @@ Every chunk should contain:
 
 All market analysis must:
 
-- use actual retrieved data
+- use actual retrieved data (no fabrication)
 - separate facts from interpretation
 - avoid invented statistics
 
@@ -2616,8 +3551,8 @@ All market analysis must:
 
 News-based reasoning must:
 
-- cite article source
-- distinguish article facts from AI inference
+- cite article source (URL + title)
+- distinguish article facts from AI inference (label analysis clearly)
 
 ---
 
@@ -2626,11 +3561,11 @@ News-based reasoning must:
 ## 73.1 Session Lifecycle
 
 ```text
-create
-→ persist
-→ update
-→ reload
-→ delete
+Create (POST /api/sessions, title="New Chat")
+    → First user query triggers title generation (async)
+    → All messages persisted (user + assistant)
+    → Reload (GET /api/sessions/{id} returns messages)
+    → Delete (DELETE /api/sessions/{id}, cascade deletes messages)
 ```
 
 ---
@@ -2639,9 +3574,8 @@ create
 
 Every completed interaction must persist:
 
-- user message
-- assistant response
-- structured metadata
+- user message (role="user", content=query)
+- assistant response (role="assistant", content=markdown, metadata_json=structured_data+citations)
 
 ---
 
@@ -2651,10 +3585,10 @@ Every completed interaction must persist:
 
 Structured metadata is used for:
 
-- frontend rendering
-- market panel updates
-- chart rendering
-- testing assertions
+- frontend market panel rendering
+- chart rendering (Recharts data)
+- testing assertions (verifiable JSON output)
+- session history display
 
 ---
 
@@ -2663,8 +3597,8 @@ Structured metadata is used for:
 Metadata must remain:
 
 - JSON serializable
-- deterministic
-- normalized
+- deterministic (same input → same structure)
+- normalized keys (snake_case in Python, camelCase in TypeScript)
 
 ---
 
@@ -2672,91 +3606,118 @@ Metadata must remain:
 
 ## 75.1 Frontend Error Display
 
-Frontend should display:
-
-- toast notification
-- retry button
-- failed state indicator
+Frontend displays:
+- Toast notification (sonner)
+- Inline error message (in chat)
+- Retry button (re-sends query)
 
 ---
 
-## 75.2 Backend Error Format
+## 75.2 Backend Error Format (Unified)
 
-````json
+All errors use:
+
+```json
 {
   "error": {
     "type": "MarketAPIError",
-    "message": "Failed to retrieve market data"
+    "message": "Failed to retrieve market data for TSLA"
   }
 }
-````
+```
+
+GraphState.error stores: `{"type": "...", "message": "..."}` (dict, not string).
+
+Error types: `LLMError`, `MarketAPIError`, `TavilyError`, `RetrievalError`, `ValidationError`, `InternalError`.
 
 ---
+
 # 76. Local File Storage
+
 ## 76.1 Knowledge Base Directory
-`knowledge_base/`
 
-stores:
+`knowledge_base/` (project root) stores:
 
-- uploaded documents
-- parsed intermediate files
+- uploaded documents (raw files)
+- parsed intermediate files (if any)
 
 ---
 
 ## 76.2 Storage Constraints
 
-No cloud storage integration required.
+No cloud storage integration required. Everything local.
 
 ---
 
 # 77. Environment Setup
+
 ## 77.1 Backend Setup
-``` 
+
+```bash
 python -m venv venv
 pip install -r requirements.txt
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
 ---
 
 ## 77.2 Frontend Setup
-```
+
+```bash
 npm install
-npm run dev
+npm run dev    # Next.js on port 3000
 ```
 
+---
+
 # 78. Startup Script Specification
+
 ## 78.1 Required File
-`start_project.bat`
+
+`start_project.bat` at project root.
 
 ---
 
 ## 78.2 Script Responsibilities
 
-The script should:
+The script:
 
-1. activate backend environment
-2. start FastAPI server
-3. start frontend server
-4. open both terminals
+1. Activates Python virtual environment
+2. Installs backend dependencies (`pip install -r backend/requirements.txt`)
+3. Installs frontend dependencies (`cd frontend && npm install`)
+4. Starts FastAPI server on port 8000 (new terminal)
+5. Starts Next.js dev server on port 3000 (new terminal)
+6. Opens browser at `http://localhost:3000`
+
+---
+
+## 78.3 Expected Ports
+
+| Service | URL |
+|---|---|
+| Frontend | http://localhost:3000 |
+| Backend API | http://localhost:8000 |
+| API Docs | http://localhost:8000/docs (Swagger) |
 
 ---
 
 # 79. README Requirements
+
 ## 79.1 Mandatory Sections
 
 README must contain:
 
 - project overview
-- architecture diagram
-- tech stack
-- setup instructions
-- API overview
-- LangGraph workflow
-- RAG pipeline
+- architecture diagram (ASCII or image)
+- tech stack summary
+- setup instructions (prerequisites, .env, startup)
+- API overview (endpoints table)
+- LangGraph workflow diagram
+- RAG pipeline diagram
 - prompt engineering strategy
 - testing strategy
 - limitations
-- future improvements
+- future improvement ideas
 
 ---
 
@@ -2764,111 +3725,112 @@ README must contain:
 
 README must include:
 
-- system architecture diagram
-- graph workflow diagram
+- system architecture diagram (frontend → backend → LangGraph → tools/DB)
+- graph workflow diagram (intent routing → flows)
 
 ---
 
-# 80. Demo Video Requirements
+# 80. Demo Requirements
+
 ## 80.1 Mandatory Demonstrations
 
-The demo video must show:
-1. project overview
-2. market question
-3. streaming response
-4. market panel update
-5. RAG upload
-6. RAG question
-7. hybrid question
-8. session switching
-9. architecture explanation
+The demo should show:
+
+1. project overview (architecture walkthrough)
+2. market question → streaming response → market panel update
+3. RAG upload → RAG question → citation display
+4. hybrid question → combined market + knowledge response
+5. session switching → history restoration
+6. architecture explanation
 
 ---
 
 # 81. Suggested Implementation Order
+
 ## 81.1 Recommended Development Sequence
-### Phase 1: backend foundation
+
+### Phase 1: Backend Foundation
 Build:
 
-- FastAPI
-- SQLite
-- SQLAlchemy
-- sessions
-- message persistence
+- FastAPI app skeleton (main.py, settings.py, CORS)
+- SQLite database (engine, models, session factory)
+- Repository layer (SessionRepository, MessageRepository)
+- Session API routes (CRUD)
+- Health API
 
----
-
-### Phase 2: LangGraph integration
+### Phase 2: LangGraph Integration
 Build:
 
-- graph
-- state
-- router
-- market flow
+- GraphState (TypedDict)
+- Graph builder (nodes + edges)
+- Intent classifier (LLM-based, function_calling)
+- All graph nodes (market, retrieval, rerank, generation, formatter, rejection)
+- Conditional routing
 
----
-
-### Phase 3: market data integration
-
+### Phase 3: Market Data Integration
 Build:
 
-- Yahoo Finance tools
-- market formatter
-- structured response
+- Yahoo Finance tool (yfinance wrapper with TTLCache)
+- Tavily Search + Extract tools
+- Market analysis prompts
+- Structured data extraction via function_calling
 
----
-
-### Phase 4: frontend chat UI
+### Phase 4: Frontend Chat UI
 Build:
 
-- sidebar
-- chat area
-- streaming rendering
+- Next.js + Tailwind + shadcn/ui setup
+- next-themes dark mode
+- Zustand stores
+- TanStack Query hooks
+- 3-panel layout (sidebar + chat + market)
+- SSE streaming renderer (fetch + ReadableStream)
+- Markdown rendering
+- Session CRUD UI
 
----
-
-### Phase 5: market panel
-
+### Phase 5: Market Panel
 Build:
 
-- price card
-- chart
-- metrics
+- PriceCard (current price + daily change)
+- TrendChart (7d/30d Recharts line)
+- MetricsCard (PE ratio, market cap, volume)
+- Panel state: empty → active
 
----
-
-### Phase 6: RAG pipeline
-
+### Phase 6: RAG Pipeline
 Build:
 
-- ingestion
-- Chroma
-- retrieval
-- rerank
+- Document upload (multipart form)
+- File parsing (.pdf, .md, .txt)
+- Chunking + embedding
+- Chroma storage (persist mode)
+- Retrieval + rerank tools
+- RAG prompts
+- Citation display in frontend
 
----
-
-### Phase 7: Playwright E2E
-
+### Phase 7: Testing
 Build:
 
-- critical user flow tests
+- All unit tests
+- Integration tests
+- API tests
+- Playwright E2E tests
+- Debug and fix all failures
 
 ---
 
 # 82. Acceptance Criteria
+
 ## 82.1 Functional Acceptance
 
 The system is considered complete when it supports:
 
-- market QA
-- RAG QA
-- hybrid QA
-- streaming responses
-- session persistence
-- session switching
-- market panel updates
-- document ingestion
+- market QA (asks a stock question → gets price, metrics, chart data)
+- RAG QA (uploads a doc → asks a question → gets grounded answer with citations)
+- hybrid QA (asks combined question → gets market data + knowledge)
+- streaming responses (tokens appear incrementally)
+- session persistence (reload page → old conversations preserved)
+- session switching (sidebar → click session → history restored)
+- market panel updates (structured_data drives right panel)
+- document ingestion (upload file → chunks stored in Chroma)
 
 ---
 
@@ -2876,12 +3838,12 @@ The system is considered complete when it supports:
 
 The system must demonstrate:
 
-- clean architecture
-- typed schemas
-- modular layering
-- test coverage
-- repository pattern
-- tool abstraction
+- clean layered architecture
+- typed schemas (Pydantic v2 for every API)
+- modular layering (api → graph → tools/services → repositories → database)
+- test coverage (70%+ backend)
+- repository pattern (no direct DB access outside repositories)
+- tool abstraction (no external API calls outside tools)
 
 ---
 
@@ -2889,67 +3851,72 @@ The system must demonstrate:
 
 Frontend must demonstrate:
 
-- responsive layout
-- streaming UX
-- markdown rendering
-- market visualization
+- responsive 3-panel layout
+- streaming UX (tokens appear in real-time)
+- markdown rendering (tables, code blocks, headings)
+- market visualization (price, chart, metrics)
+- dark mode support
 
 ---
 
 # 83. Non-Goals
+
 ## 83.1 Explicit Non-Goals
 
 The project intentionally excludes:
 
-- authentication
+- authentication / authorization
 - multi-user architecture
-- Redis
-- Docker
-- Kubernetes
+- Redis or any distributed cache
+- Docker containerization
+- Kubernetes deployment
 - distributed systems
 - production deployment
-- advanced observability
-- enterprise security
+- advanced observability (metrics, tracing)
+- enterprise security hardening
 
 ---
 
 # 84. Future Improvement Ideas
+
 ## 84.1 Potential Extensions
 
-Future improvements may include:
-
-- Redis caching
-- auth system
-- portfolio tracking
-- multi-agent architecture
-- websocket streaming
-- advanced rerank models
-- evaluation framework
-- deployment pipeline
+- Redis caching (replace TTLCache)
+- auth system (user login, personal sessions)
+- portfolio tracking (watchlist, holdings)
+- multi-agent architecture (specialist agents)
+- WebSocket streaming (bidirectional)
+- advanced rerank models (cross-encoder)
+- evaluation framework (RAGAS metrics)
+- deployment pipeline (CI/CD, Docker)
 
 ---
 
 # 85. Final Architecture Summary
+
 ## 85.1 Core Stack Summary
 
-```
+```text
 Frontend:
-Next.js + TypeScript + Tailwind + shadcn/ui
+Next.js 15 + TypeScript + TailwindCSS + shadcn/ui + next-themes
 
 Backend:
-FastAPI + LangGraph + SQLAlchemy
+FastAPI + LangGraph (LangChain) + SQLAlchemy + Pydantic v2
 
 Databases:
-SQLite + Chroma
+SQLite (relational) + Chroma (vector, persist mode)
 
 RAG:
-Embedding + Retrieval + Lightweight LLM Rerank
+BAAI/bge-small-en-v1.5 embeddings + Chroma retrieval + LLM rerank
+
+LLM:
+MiniMax-M2.7 (all tasks) — any OpenAI-compatible API via .env config
 
 Streaming:
-Event-based SSE
+Event-based SSE (fetch + ReadableStream on frontend)
 
 Testing:
-pytest + Playwright
+pytest + pytest-asyncio + httpx + Playwright
 ```
 
 ---
@@ -2960,7 +3927,7 @@ The project prioritizes:
 
 - clarity
 - modularity
-- AI-native orchestration
+- AI-native orchestration (LangGraph)
 - testability
 - data-driven responses
 
@@ -2973,21 +3940,108 @@ over:
 ---
 
 # 87. AI-Agent Execution Directive
+
 ## 87.1 Primary Instruction
 
 AI coding agents implementing this project MUST:
 
-- follow this SPD strictly
-- preserve architecture boundaries
-- avoid unnecessary abstraction
+- follow this TSD strictly (file structure, layer boundaries, naming)
+- preserve architecture boundaries (no crossing layers)
+- avoid unnecessary abstraction (don't over-engineer)
 - prioritize correctness over creativity
+- use `with_structured_output(schema, method="function_calling")` for ALL structured output
+- place ALL prompts in `.txt` files under `prompts/`
+- generate UUID4 for all IDs
+- use async/await throughout the backend
+- use UTC ISO 8601 for all timestamps
 
 ## 87.2 Final Constraint
 
 If implementation conflicts arise:
-```
-architecture consistency
->
-feature expansion
+
+```text
+architecture consistency > feature expansion
 ```
 
+When the TSD is silent on a detail, choose the simplest reasonable approach and
+maintain consistency with the rest of the codebase.
+
+---
+
+# Appendix A: Key Implementation Details Summary
+
+| Decision | Choice |
+|---|---|
+| ID format | UUID4 |
+| Backend port | 8000 |
+| Frontend port | 3000 |
+| SQLite path | `./backend/data/sqlite.db` |
+| Chroma path | `./backend/chroma_db/` |
+| Knowledge base | `./knowledge_base/` |
+| Chunk size | 800 chars |
+| Chunk overlap | 150 chars |
+| Retrieval top-k | 8 |
+| Rerank top-n | 4 |
+| Market cache TTL | 60 seconds |
+| Cache max size | 128 entries |
+| Streaming method | SSE (text/event-stream) |
+| Structured output | `with_structured_output(schema, method="function_calling")` |
+| Prompt format | `.txt` files with `{placeholder}` templates |
+| Default model | MiniMax-M2.7 |
+| LLM provider | OpenAI-compatible (configurable via .env) |
+| Timestamp format | UTC ISO 8601 |
+| Error format | `{"error": {"type": "...", "message": "..."}}` |
+
+---
+
+# Appendix B: Graph Flow Summary
+
+```text
+Intent: market
+━━━━━━━━━━━━━━━━━
+intent → market_data → news → generation → formatter → END
+
+Intent: rag
+━━━━━━━━━━━━━━━━━
+intent → retrieval → rerank → generation → formatter → END
+
+Intent: hybrid (sequential: market first, then RAG, then merge)
+━━━━━━━━━━━━━━━━━
+intent → market_data → news → retrieval → rerank → merge → generation → formatter → END
+
+Note: Hybrid runs both phases sequentially (not in parallel).
+     - Phase 1: market_data + news (sets state["market_data"], state["news_data"])
+     - Phase 2: retrieval + rerank (sets state["retrieved_docs"], state["reranked_docs"])
+     - Merge: combine all context from state into a single prompt context
+     - Generation: LLM synthesizes market + RAG + news context
+
+Intent: unsupported
+━━━━━━━━━━━━━━━━━
+intent → rejection → END
+```
+
+---
+
+# Appendix C: SSE Event Sequence
+
+```text
+event: token
+data: {"content": "Based"}
+
+event: token
+data: {"content": " on"}
+
+event: token
+data: {"content": " current"}
+
+... more tokens ...
+
+event: structured_data
+data: {"active_asset": "TSLA", "price": 221.13, ...}
+
+event: citations
+data: [{"title": "...", "url": "...", "source_type": "web"}, ...]
+
+event: done
+data: {"session_id": "550e8400-..."}
+```
