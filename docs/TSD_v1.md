@@ -175,7 +175,7 @@ LangGraph acts as:
 | Intent Router (LLM-based)                        |
 |   ├── Market Data Flow                           |
 |   ├── RAG Flow                                   |
-|   ├── Hybrid Flow (market + RAG in parallel)     |
+|   ├── Hybrid Flow (market + news + RAG sequential)    |
 |   └── Unsupported Query Flow                     |
 +--------------------------------------------------+
                            |
@@ -340,23 +340,21 @@ The center chat area manages:
 
 ## 5.4 Market Panel Responsibilities
 
-The right market panel displays:
+The right market panel displays per-asset market data.
 
-- current asset price
-- daily change (absolute and percentage)
-- 7-day trend chart (Recharts line chart)
-- PE ratio
-- market cap
-- trading volume
-- detected active asset ticker
+**Single asset:** Shows PriceCard, TrendChart, and MetricsCard for the detected ticker.
 
-This panel updates dynamically based on:
+**Multiple assets:** A Tab bar appears at the top of the panel (e.g., `TSLA | AAPL | BABA`).
+Each tab displays a full set of PriceCard + TrendChart + MetricsCard for the selected ticker.
+The first asset in the list is selected by default.
+
+The panel updates dynamically based on:
 
 ```text
-structured_data.active_asset
+structured_data.assets
 ```
 
-returned by backend responses.
+returned by backend responses. `assets` is a list of `AssetData` objects (one per ticker).
 
 ---
 
@@ -464,17 +462,25 @@ Intent examples:
 User Query → Intent Node (routes to "market")
     ↓
 Market Data Tool Node
-    ├── Fetch price, metrics from Yahoo Finance
-    ├── Fetch related news from Tavily Search
-    └── Extract full article content via Tavily Extract (if needed)
+    ├── Extract ticker symbol(s) from query via LLM
+    ├── Fetch price, metrics from Yahoo Finance for each ticker
+    └── Normalize and cache results
+    ↓
+News Node (Tavily Search)
+    ├── Search for "[TICKER] stock news" for each ticker
+    └── Return top 5 results with URLs and snippets
+    ↓
+Extract Node (Tavily Extract)
+    ├── Extract full article text from top 2 news URLs
+    └── Store extracted content in state.extracted_articles
     ↓
 Response Generation Node
-    ├── Build market analysis prompt with fetched data
+    ├── Build market analysis prompt with fetched data + news + extracted articles
     ├── LLM generates markdown response
-    └── Extract structured_data via function_calling
+    └── Extract structured_data + citations via function_calling
     ↓
 Structured Formatter Node
-    ├── Normalize structured_data
+    ├── Normalize structured_data (single or multi-asset)
     ├── Assemble citations
     └── Set final_response
     ↓
@@ -522,23 +528,26 @@ Phase 1: Market Data Node (Yahoo Finance)
     ↓
 Phase 2: News Node (Tavily Search)
     ↓
-Phase 3: Retrieval Node (Chroma search)
+Phase 3: Extract Node (Tavily Extract — top 2 articles)
     ↓
-Phase 4: Rerank Node (LLM selects best chunks)
+Phase 4: Retrieval Node (Chroma search)
     ↓
-Phase 5: Merge Node (combine all context: market + news + RAG)
+Phase 5: Rerank Node (LLM selects best chunks)
     ↓
-Phase 6: Response Generation Node
-    (LLM synthesizes market data, news, and retrieved knowledge)
+Phase 6: Merge Node (LLM synthesizes all context: market + news + extracted articles + RAG)
     ↓
-Phase 7: Structured Formatter Node
+Phase 7: Response Generation Node
+    (LLM generates final markdown response)
+    ↓
+Phase 8: Structured Formatter Node
     ↓
 Stream to Frontend via SSE
 ```
 
-The hybrid flow runs both phases sequentially (market data + news first, then RAG).
-Phase 5 (merge) combines all gathered context — market metrics, news articles,
-and retrieved document chunks — into a single prompt for the generation LLM.
+The hybrid flow runs both phases sequentially (market data + news + extract first, then RAG).
+Phase 6 (merge) uses LLM to synthesize all gathered context — market metrics, news articles,
+extracted article full text, and retrieved document chunks — into a single coherent context
+for the generation node.
 
 Example hybrid query:
 
@@ -564,6 +573,40 @@ Stream to Frontend via SSE
 ```
 
 The rejection message should be polite and informative, not a cold error.
+
+---
+
+## 7.7 Multi-Asset Query Support
+
+The system supports queries involving multiple stock tickers (e.g., "Compare TSLA and AAPL").
+
+### Backend
+
+- **Ticker Extraction:** The market_data node uses LLM function calling to extract all
+  ticker symbols from the query into `state["tickers"]`.
+- **Data Fetching:** Yahoo Finance data is fetched independently for each ticker.
+  Results are stored in `state["market_data"]` keyed by symbol.
+- **News Search:** Tavily search runs for each ticker individually. Results are merged
+  into `state["news_data"]`.
+- **Structured Output:** `StructuredData.assets` is a `list[AssetData]`, one entry per ticker.
+  Each `AssetData` includes `symbol`, `price`, `change`, `change_pct`, `trend`,
+  `market_metrics`, and `chart_data`.
+
+### Frontend Market Panel
+
+- **Single asset:** No change from the base design — PriceCard, TrendChart, MetricsCard
+  render directly for the single ticker.
+- **Multiple assets:** A Tab bar appears at the top of the Market Panel with one tab
+  per ticker (e.g., `TSLA | AAPL | BABA`). The first asset is selected by default.
+  Each tab displays a complete set of PriceCard + TrendChart + MetricsCard.
+  Tab switching is purely client-side with no additional API calls.
+
+### Design Principle
+
+No backward compatibility layer is needed. The `assets` list is the single source of
+truth. Single-asset queries produce a list of length 1; multi-asset queries produce a
+list of length N. The frontend renders tabs conditionally: tabs hidden when N=1, shown
+when N>1.
 
 ---
 
@@ -605,8 +648,10 @@ class GraphState(TypedDict):
     reranked_docs: list[dict]        # top-N chunks after LLM rerank (N=4)
 
     # Market data
-    market_data: dict                # raw normalized market data
+    tickers: list[str]               # detected ticker symbols from query (e.g. ["TSLA", "AAPL"])
+    market_data: dict                # raw normalized market data per ticker
     news_data: list[dict]            # Tavily search results
+    extracted_articles: list[dict]   # Tavily Extract full article text per URL
 
     # Citations
     citations: list[dict]            # [{"title": "...", "url": "...", "source_type": "..."}]
@@ -854,7 +899,19 @@ Local model loaded via `sentence-transformers` or `langchain_community.embedding
 
 ---
 
-## 12.5 Lightweight Rerank Strategy
+## 12.5 Chroma Collection
+
+All documents are stored in a single Chroma collection:
+
+```text
+collection_name = "financial_knowledge"
+```
+
+The collection is created on first use and persisted to disk under `CHROMA_PATH`.
+
+---
+
+## 12.6 Lightweight Rerank Strategy
 
 The rerank stage uses:
 
@@ -881,7 +938,7 @@ Final context assembly (ordered by relevance)
 
 ---
 
-## 12.6 Chunk Metadata
+## 12.7 Chunk Metadata
 
 Every chunk stored in Chroma must include:
 
@@ -958,6 +1015,23 @@ Market queries automatically trigger news search via **Tavily Search**:
 
 # 14. API Architecture
 
+## 14.0 Streaming vs Non-Streaming
+
+The `/api/chat` endpoint supports two modes via `stream` parameter:
+
+- **Streaming (`stream=True`, default):** Returns `text/event-stream`. The full LangGraph
+  workflow executes, and results are delivered incrementally via SSE events. Used by the
+  frontend for real-time UX.
+
+- **Non-Streaming (`stream=False`):** Returns `application/json`. The full LangGraph
+  workflow executes identically, but results are collected and returned as a single
+  `ChatResponse` JSON object after graph completion. Used for testing and programmatic
+  API consumption.
+
+Both modes execute the same graph logic — only the delivery mechanism differs.
+
+---
+
 ## 14.1 API Design Principles
 
 All APIs must:
@@ -1033,8 +1107,10 @@ data: {"content": " stock"}
 
 ```text
 event: structured_data
-data: {"active_asset": "TSLA", "price": 221.13, "change_pct": 2.4, "trend": "bullish", "market_metrics": {...}, "chart_data": {...}}
+data: {"assets": [{"symbol": "TSLA", "price": 221.13, "change": 5.20, "change_pct": 2.4, "trend": "bullish", "market_metrics": {...}, "chart_data": {...}}]}
 ```
+
+For multi-asset queries, `assets` array contains multiple entries (one per ticker).
 
 ---
 
@@ -1286,13 +1362,18 @@ After the first user query in a new session:
 
 ```text
 1. Persist user message + assistant response
-2. Async call LLM (MiniMax-M2.7) with prompt:
+2. Fire-and-forget via FastAPI BackgroundTasks:
+   LLM (MiniMax-M2.7) with prompt:
    "Generate a short title (max 5 words) for this conversation.
     Query: {user_query}
     Response summary: {response_summary}"
 3. Update session title in SQLite
 4. Frontend refetches session list to show new title
 ```
+
+Title generation is a fire-and-forget background task — the user's chat response
+is never delayed by title generation. The frontend observes title updates via
+TanStack Query cache invalidation.
 
 Example titles:
 
@@ -1330,6 +1411,47 @@ Responsibilities:
 |---|---|
 | Backend (FastAPI) | 8000 |
 | Frontend (Next.js) | 3000 |
+
+---
+
+## 22.3 Environment Requirements
+
+| Requirement | Version |
+|---|---|
+| Python | 3.11+ |
+| Node.js | 20 LTS+ |
+| npm | 10+ |
+| OS | Windows / macOS / Linux |
+
+### CORS Configuration
+
+For local development, the backend allows requests from `http://localhost:3000`:
+
+```python
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+```
+
+No production CORS hardening is needed (academic scope).
+
+### yfinance Async Wrapper
+
+Since `yfinance` is a synchronous library, all calls are wrapped with `asyncio.to_thread()`
+to avoid blocking the async event loop:
+
+```python
+import asyncio
+
+async def fetch_market_data(symbol: str) -> dict:
+    return await asyncio.to_thread(_fetch_market_data_sync, symbol)
+```
 
 ---
 
@@ -1459,8 +1581,6 @@ financial-asset-qa-system/
 
 ```text
 backend/
-├── app/
-
 ├── api/
 │   ├── routes/
 │   │   ├── chat.py              # POST /api/chat (SSE streaming)
@@ -1484,9 +1604,10 @@ backend/
 │   │   ├── intent_node.py       # Classify intent, set state.intent
 │   │   ├── market_node.py       # Fetch Yahoo Finance data, set state.market_data
 │   │   ├── news_node.py         # Tavily search, set state.news_data
+│   │   ├── extract_node.py      # Tavily Extract full article text
 │   │   ├── retrieval_node.py    # Chroma similarity search
 │   │   ├── rerank_node.py       # LLM rerank top-k chunks
-│   │   ├── merge_node.py        # Combine market + news + RAG context (hybrid only)
+│   │   ├── merge_node.py        # LLM synthesize market + news + RAG context (hybrid only)
 │   │   ├── generation_node.py   # LLM response generation
 │   │   ├── formatter_node.py    # Normalize structured_data + citations
 │   │   └── rejection_node.py    # Friendly rejection for unsupported queries
@@ -1579,13 +1700,12 @@ backend/
 ```text
 frontend/
 ├── src/
+│   ├── app/
+│   │   ├── layout.tsx               # Root layout (providers: QueryClient, ThemeProvider, Zustand)
+│   │   ├── page.tsx                 # Main page: 3-panel layout
+│   │   └── globals.css              # Tailwind directives + custom scrollbar styles
 
-├── app/
-│   ├── layout.tsx               # Root layout (providers: QueryClient, ThemeProvider, Zustand)
-│   ├── page.tsx                 # Main page: 3-panel layout
-│   └── globals.css              # Tailwind directives + custom scrollbar styles
-
-├── components/
+│   ├── components/
 │   ├── chat/
 │   │   ├── ChatContainer.tsx    # Chat area wrapper
 │   │   ├── ChatMessage.tsx      # Single message (markdown rendered)
@@ -1619,52 +1739,53 @@ frontend/
 │       ├── ErrorToast.tsx       # Toast error display + retry button
 │       └── ThemeToggle.tsx      # Dark/light/system theme switcher
 
-├── features/
-│   ├── chat/
-│   │   └── useChatFeature.ts    # Composes useStreaming + useChat hook + chatStore
-│   ├── sessions/
-│   │   └── useSessionFeature.ts # Session CRUD operations
-│   ├── market/
-│   │   └── useMarketPanel.ts    # Derives market panel state from structured_data
-│   └── rag/
-│       └── useRagUpload.ts      # Document upload mutation
-
-├── services/
-│   ├── api/
-│   │   ├── client.ts            # Base fetch wrapper (base URL, error handling)
-│   │   ├── chat.ts              # POST /api/chat (streaming + non-streaming)
-│   │   ├── sessions.ts          # Session CRUD API calls
-│   │   ├── rag.ts               # POST /api/rag/upload
-│   │   └── health.ts            # GET /api/health
+│   ├── features/
+│   │   ├── chat/
+│   │   │   └── useChatFeature.ts    # Composes useStreaming + useChat hook + chatStore
+│   │   ├── sessions/
+│   │   │   └── useSessionFeature.ts # Session CRUD operations
+│   │   ├── market/
+│   │   │   └── useMarketPanel.ts    # Derives market panel state from structured_data
+│   │   └── rag/
+│   │       └── useRagUpload.ts      # Document upload mutation
 │   │
-│   ├── sse/
-│   │   └── sseClient.ts         # fetch + ReadableStream SSE parser
+│   ├── services/
+│   │   ├── api/
+│   │   │   ├── client.ts            # Base fetch wrapper (base URL, error handling)
+│   │   │   ├── chat.ts              # POST /api/chat (streaming + non-streaming)
+│   │   │   ├── sessions.ts          # Session CRUD API calls
+│   │   │   ├── rag.ts               # POST /api/rag/upload
+│   │   │   └── health.ts            # GET /api/health
+│   │   │
+│   │   ├── sse/
+│   │   │   └── sseClient.ts         # fetch + ReadableStream SSE parser
+│   │   │
+│   │   └── session/
+│   │       └── sessionManager.ts    # Session lifecycle helpers
 │   │
-│   └── session/
-│       └── sessionManager.ts    # Session lifecycle helpers
-
-├── hooks/
-│   ├── useChat.ts               # Chat message sending + response handling
-│   ├── useStreaming.ts          # SSE stream consumption + state updates
-│   ├── useSessions.ts           # TanStack Query hooks for sessions
-│   └── useMarketPanel.ts        # Market panel data derivation
-
-├── stores/
-│   ├── sessionStore.ts          # Zustand: activeSessionId, sidebarOpen
-│   ├── chatStore.ts             # Zustand: streamingTokens, isStreaming, messages cache
-│   └── uiStore.ts               # Zustand: theme preference, toasts
-
-├── types/
-│   ├── api.ts                   # API request/response types
-│   ├── session.ts               # Session, SessionDetail types
-│   ├── chat.ts                  # ChatMessage, StreamingEvent types
-│   └── market.ts                # MarketData, ChartData types
-
-├── lib/
-│   ├── markdown.ts              # Markdown components customization
-│   ├── utils.ts                 # General utilities
-│   └── constants.ts             # API base URL, config constants
-
+│   ├── hooks/
+│   │   ├── useChat.ts               # Chat message sending + response handling
+│   │   ├── useStreaming.ts          # SSE stream consumption + state updates
+│   │   ├── useSessions.ts           # TanStack Query hooks for sessions
+│   │   └── useMarketPanel.ts        # Market panel data derivation
+│   │
+│   ├── stores/
+│   │   ├── sessionStore.ts          # Zustand: activeSessionId, sidebarOpen
+│   │   ├── chatStore.ts             # Zustand: streamingTokens, isStreaming, messages cache
+│   │   └── uiStore.ts               # Zustand: theme preference, toasts
+│   │
+│   ├── types/
+│   │   ├── api.ts                   # API request/response types
+│   │   ├── session.ts               # Session, SessionDetail types
+│   │   ├── chat.ts                  # ChatMessage, StreamingEvent types
+│   │   └── market.ts                # MarketData, AssetData, ChartData types
+│   │
+│   └── lib/
+│       ├── markdown.ts              # Markdown components customization
+│       ├── utils.ts                 # General utilities
+│       └── constants.ts             # API base URL, config constants
+│
+├── public/
 ├── tests/
 │   └── e2e/
 │       ├── chat.spec.ts
@@ -1672,8 +1793,7 @@ frontend/
 │       ├── rag.spec.ts
 │       ├── streaming.spec.ts
 │       └── market_panel.spec.ts
-
-├── public/
+│
 ├── package.json
 ├── tailwind.config.ts
 ├── tsconfig.json
@@ -1950,9 +2070,10 @@ workflow = StateGraph(GraphState)
 workflow.add_node("intent", intent_node)
 workflow.add_node("market_data", market_node)        # Yahoo Finance + normalize
 workflow.add_node("news", news_node)                  # Tavily search
+workflow.add_node("extract", extract_node)            # Tavily Extract full article text
 workflow.add_node("retrieval", retrieval_node)        # Chroma similarity search
 workflow.add_node("rerank", rerank_node)              # LLM rerank
-workflow.add_node("merge", merge_node)                # Combine market + RAG context (hybrid only)
+workflow.add_node("merge", merge_node)                # LLM synthesize market + news + extract + RAG context (hybrid only)
 workflow.add_node("generation", generation_node)      # LLM response generation
 workflow.add_node("formatter", formatter_node)        # Normalize structured_data + citations
 workflow.add_node("rejection", rejection_node)        # Friendly rejection for unsupported
@@ -1975,10 +2096,13 @@ workflow.add_conditional_edges(
 # market_data → news (shared by market and hybrid flows)
 workflow.add_edge("market_data", "news")
 
-# After news: market → generation, hybrid → retrieval (RAG phase)
+# news → extract (shared by market and hybrid flows)
+workflow.add_edge("news", "extract")
+
+# After extract: market → generation, hybrid → retrieval (RAG phase)
 workflow.add_conditional_edges(
-    "news",
-    route_after_news,
+    "extract",
+    route_after_extract,
     {
         "market": "generation",
         "hybrid": "retrieval",
@@ -2030,8 +2154,8 @@ def route_by_intent(state: GraphState) -> str:
     return "unsupported"
 
 
-def route_after_news(state: GraphState) -> str:
-    """After news node: market goes to generation, hybrid continues to RAG phase."""
+def route_after_extract(state: GraphState) -> str:
+    """After extract node: market goes to generation, hybrid continues to RAG phase."""
     if state.get("error"):
         return "market"  # will go to generation which skips on error
     intent = state["intent"]
@@ -2147,9 +2271,16 @@ Responsibilities:
 
 File: `tools/tavily_extract_tool.py`
 
+Corresponding graph node: `graph/nodes/extract_node.py`
+
 Responsibilities:
-- extract full article text from URLs returned by Tavily Search
-- return clean text content for LLM context
+- take top 2 URLs from `state["news_data"]`
+- extract full article text from each URL via Tavily Extract API
+- return list of cleaned text content with source URL
+- store results in `state["extracted_articles"]`
+
+This is a dedicated LangGraph node (not embedded in the news node), placed after
+the news node in market and hybrid flows.
 
 ---
 
@@ -2243,15 +2374,15 @@ Initial implementations:
 The choice of provider is driven entirely by `.env`:
 
 ```
-# For MiniMax:
-LLM_API_KEY=sk-cp-...
-LLM_BASE_URL=https://api.minimaxi.com/v1
-LLM_MODEL=MiniMax-M2.7
+# For MiniMax (default):
+MINIMAX_API_KEY=sk-cp-...
+MINIMAX_BASE_URL=https://api.minimaxi.com/v1
+MINIMAX_MODEL=MiniMax-M2.7
 
 # For OpenAI (just change env vars):
-LLM_API_KEY=sk-...
-LLM_BASE_URL=https://api.openai.com/v1
-LLM_MODEL=gpt-4o
+MINIMAX_API_KEY=sk-...
+MINIMAX_BASE_URL=https://api.openai.com/v1
+MINIMAX_MODEL=gpt-4o
 ```
 
 ---
@@ -2401,27 +2532,50 @@ Sources:
 
 ## 42.1 Structured Metadata Schema
 
+The structured metadata uses an asset-list model. Single-asset queries produce a list of length 1.
+Multi-asset queries produce a list with one entry per ticker.
+
 ```json
 {
-  "active_asset": "TSLA",
-  "price": 221.13,
-  "change": 5.20,
-  "change_pct": 2.4,
-  "trend": "bullish",
-  "market_metrics": {
-    "market_cap": "692.5B",
-    "pe_ratio": 62.3,
-    "volume": "58.2M"
-  },
-  "chart_data": {
-    "7d": [
-      {"date": "2026-05-05", "close": 218.50},
-      {"date": "2026-05-06", "close": 220.10}
-    ],
-    "30d": [
-      {"date": "2026-04-12", "close": 205.30}
-    ]
-  }
+  "assets": [
+    {
+      "symbol": "TSLA",
+      "price": 221.13,
+      "change": 5.20,
+      "change_pct": 2.4,
+      "trend": "bullish",
+      "market_metrics": {
+        "market_cap": "692.5B",
+        "pe_ratio": 62.3,
+        "volume": "58.2M"
+      },
+      "chart_data": {
+        "7d": [
+          {"date": "2026-05-05", "close": 218.50},
+          {"date": "2026-05-06", "close": 220.10}
+        ],
+        "30d": [
+          {"date": "2026-04-12", "close": 205.30}
+        ]
+      }
+    },
+    {
+      "symbol": "AAPL",
+      "price": 198.45,
+      "change": -1.30,
+      "change_pct": -0.65,
+      "trend": "bearish",
+      "market_metrics": {
+        "market_cap": "3.08T",
+        "pe_ratio": 32.1,
+        "volume": "45.1M"
+      },
+      "chart_data": {
+        "7d": [...],
+        "30d": [...]
+      }
+    }
+  ]
 }
 ```
 
@@ -2432,8 +2586,8 @@ Sources:
 Structured data is extracted from LLM output via `with_structured_output`:
 
 ```python
-class StructuredData(BaseModel):
-    active_asset: str | None = None
+class AssetData(BaseModel):
+    symbol: str
     price: float | None = None
     change: float | None = None
     change_pct: float | None = None
@@ -2441,11 +2595,18 @@ class StructuredData(BaseModel):
     market_metrics: dict | None = None
     chart_data: dict | None = None
 
+class StructuredData(BaseModel):
+    assets: list[AssetData]
+
 structured_llm = model.with_structured_output(
     StructuredData,
     method="function_calling",
 )
 ```
+
+The backend fills `chart_data` with actual Yahoo Finance historical data
+(not LLM-generated). The LLM extracts symbol, price, change, trend, and metrics;
+the chart data is injected by the formatter node from `state.market_data`.
 
 ---
 
@@ -2579,7 +2740,8 @@ components/chat/
 
 ```text
 components/market/
-├── MarketPanel.tsx          # Right panel, shows empty state or market data
+├── MarketPanel.tsx          # Right panel container, handles empty vs active state
+├── AssetTabs.tsx            # Tab bar for multi-asset switching (hidden when single asset)
 ├── PriceCard.tsx            # Large price display + change badge (green/red)
 ├── TrendChart.tsx           # Recharts <LineChart>, toggle 7d/30d
 └── MetricsCard.tsx          # Grid of PE ratio, market cap, volume
@@ -2615,6 +2777,7 @@ layout.tsx
     │   ├── CitationList
     │   └── ChatInput
     └── MarketPanel
+        ├── AssetTabs (shown only when assets.length > 1)
         ├── PriceCard
         ├── TrendChart
         └── MetricsCard
@@ -2674,7 +2837,7 @@ The renderer must support:
 
 ## 48.1 Panel Update Trigger
 
-The market panel updates when a SSE `structured_data` event contains `active_asset`.
+The market panel updates when a SSE `structured_data` event contains `assets` with one or more entries.
 
 ---
 
@@ -2685,9 +2848,22 @@ The market panel updates when a SSE `structured_data` event contains `active_ass
 "Ask a market question to see data here"
 ```
 
+For RAG-only or unsupported queries, the panel remains in the empty state.
+
 ---
 
-## 48.3 Price Color Coding
+## 48.3 Multi-Asset Tab Switching
+
+When `assets` contains multiple entries:
+
+- A Tab bar appears at the top: `TSLA | AAPL | BABA`
+- The first asset is selected by default
+- Clicking a tab switches the displayed PriceCard, TrendChart, and MetricsCard
+- Tab switching is purely client-side (no API call)
+
+---
+
+## 48.4 Price Color Coding
 
 - Positive change: green
 - Negative change: red
@@ -3302,9 +3478,9 @@ Critical graph behaviors:
 ## 65.2 Required Graph Tests
 
 ```text
-- market route: intent="market" → market_node → news_node → generation_node → formatter_node
+- market route: intent="market" → market_node → news_node → extract_node → generation_node → formatter_node
 - rag route: intent="rag" → retrieval_node → rerank_node → generation_node → formatter_node
-- hybrid route: intent="hybrid" → market_node + retrieval_node in parallel → merge → generation_node → formatter_node
+- hybrid route: intent="hybrid" → market_node → news_node → extract_node → retrieval_node → rerank_node → merge_node → generation_node → formatter_node
 - unsupported route: intent="unsupported" → rejection_node → END
 - rerank execution: 8 chunks in → 4 chunks out
 - formatter execution: structured_data normalized, citations assembled
@@ -3973,11 +4149,16 @@ maintain consistency with the rest of the codebase.
 | Decision | Choice |
 |---|---|
 | ID format | UUID4 |
+| Python version | 3.11+ |
+| Node.js version | 20 LTS+ |
 | Backend port | 8000 |
 | Frontend port | 3000 |
+| CORS origin (dev) | `http://localhost:3000` |
 | SQLite path | `./backend/data/sqlite.db` |
 | Chroma path | `./backend/chroma_db/` |
-| Knowledge base | `./knowledge_base/` |
+| Chroma collection | `financial_knowledge` |
+| Knowledge base | `./knowledge_base/` (pre-loaded with Chinese docs) |
+| Documents pre-loaded | `pe_ratio.md`, `dcf_valuation.md`, `ebitda.md` |
 | Chunk size | 800 chars |
 | Chunk overlap | 150 chars |
 | Retrieval top-k | 8 |
@@ -3988,9 +4169,15 @@ maintain consistency with the rest of the codebase.
 | Structured output | `with_structured_output(schema, method="function_calling")` |
 | Prompt format | `.txt` files with `{placeholder}` templates |
 | Default model | MiniMax-M2.7 |
+| LLM env vars | `MINIMAX_API_KEY`, `MINIMAX_BASE_URL`, `MINIMAX_MODEL` |
 | LLM provider | OpenAI-compatible (configurable via .env) |
 | Timestamp format | UTC ISO 8601 |
 | Error format | `{"error": {"type": "...", "message": "..."}}` |
+| yfinance integration | `asyncio.to_thread()` wrapper for sync calls |
+| Title generation | FastAPI BackgroundTasks (fire-and-forget) |
+| Backend package root | `backend/` (no intermediate `app/` package) |
+| Frontend source root | `frontend/src/` (Next.js 15 convention) |
+| User language | Simplified Chinese (all UI and knowledge docs) |
 
 ---
 
@@ -3999,7 +4186,7 @@ maintain consistency with the rest of the codebase.
 ```text
 Intent: market
 ━━━━━━━━━━━━━━━━━
-intent → market_data → news → generation → formatter → END
+intent → market_data → news → extract → generation → formatter → END
 
 Intent: rag
 ━━━━━━━━━━━━━━━━━
@@ -4007,13 +4194,13 @@ intent → retrieval → rerank → generation → formatter → END
 
 Intent: hybrid (sequential: market first, then RAG, then merge)
 ━━━━━━━━━━━━━━━━━
-intent → market_data → news → retrieval → rerank → merge → generation → formatter → END
+intent → market_data → news → extract → retrieval → rerank → merge → generation → formatter → END
 
-Note: Hybrid runs both phases sequentially (not in parallel).
-     - Phase 1: market_data + news (sets state["market_data"], state["news_data"])
+Note: Hybrid runs phases sequentially (not in parallel).
+     - Phase 1: market_data + news + extract (sets state["market_data"], state["news_data"], state["extracted_articles"])
      - Phase 2: retrieval + rerank (sets state["retrieved_docs"], state["reranked_docs"])
-     - Merge: combine all context from state into a single prompt context
-     - Generation: LLM synthesizes market + RAG + news context
+     - Merge: LLM synthesizes all context (market + news + extracted articles + RAG chunks)
+     - Generation: LLM generates final markdown answer from the merged context
 
 Intent: unsupported
 ━━━━━━━━━━━━━━━━━
@@ -4037,7 +4224,7 @@ data: {"content": " current"}
 ... more tokens ...
 
 event: structured_data
-data: {"active_asset": "TSLA", "price": 221.13, ...}
+data: {"assets": [{"symbol": "TSLA", "price": 221.13, "change": 5.20, "change_pct": 2.4, "trend": "bullish", "market_metrics": {...}, "chart_data": {...}}]}
 
 event: citations
 data: [{"title": "...", "url": "...", "source_type": "web"}, ...]
