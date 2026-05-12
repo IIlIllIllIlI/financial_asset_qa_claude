@@ -23,10 +23,14 @@ export async function apiGet(url: string) {
 }
 
 export async function apiPost(url: string, body?: unknown) {
+  const headers: Record<string, string> = {};
+  if (body !== undefined) {
+    headers["Content-Type"] = "application/json";
+  }
   const res = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: body ? JSON.stringify(body) : undefined,
+    headers,
+    body: body !== undefined ? JSON.stringify(body) : undefined,
   });
   return handleResponse(res);
 }

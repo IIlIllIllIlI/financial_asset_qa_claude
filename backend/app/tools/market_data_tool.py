@@ -1,6 +1,7 @@
 """Yahoo Finance market data tool with TTLCache."""
 
 import asyncio
+import re
 from typing import Any
 
 from cachetools import TTLCache
@@ -11,6 +12,31 @@ from app.utils.errors import MarketAPIError
 from app.utils.logger import setup_logger
 
 logger = setup_logger("tools.market")
+
+# Chinese company name → ticker mapping for fuzzy matching
+_CN_NAME_TO_TICKER: dict[str, str] = {
+    "特斯拉": "TSLA",
+    "苹果": "AAPL",
+    "英伟达": "NVDA",
+    "谷歌": "GOOGL",
+    "微软": "MSFT",
+    "亚马逊": "AMZN",
+    "脸书": "META",
+    "meta": "META",
+    "台积电": "TSM",
+    "英特尔": "INTC",
+    "amd": "AMD",
+    "阿里巴巴": "BABA",
+    "腾讯": "TCEHY",
+    "比亚迪": "BYDDY",
+    "蔚来": "NIO",
+    "小鹏": "XPEV",
+    "理想": "LI",
+    "拼多多": "PDD",
+    "京东": "JD",
+    "百度": "BIDU",
+    "网易": "NTES",
+}
 
 market_cache: TTLCache = TTLCache(maxsize=MARKET_CACHE_MAXSIZE, ttl=MARKET_CACHE_TTL)
 
@@ -125,19 +151,48 @@ async def fetch_all_market_data(tickers: list[str]) -> dict[str, dict]:
     return result_dict
 
 
+def _extract_tickers_regex(query: str) -> list[str]:
+    """Extract tickers using regex and Chinese name mapping — reliable fallback."""
+    tickers: list[str] = []
+
+    # Match uppercase ticker patterns like TSLA, AAPL
+    uppercase = re.findall(r"\b([A-Z]{2,5})\b", query)
+    tickers.extend(t.upper() for t in uppercase)
+
+    # Match known Chinese company names
+    query_lower = query.lower()
+    for name, ticker in _CN_NAME_TO_TICKER.items():
+        if name.lower() in query_lower:
+            tickers.append(ticker)
+
+    return list(dict.fromkeys(tickers))  # dedup preserving order
+
+
 async def extract_tickers(query: str, model) -> list[str]:
-    """Extract ticker symbols from query via LLM function_calling."""
-    try:
-        structured_llm = model.with_structured_output(TickerList, method="function_calling")
-        result = await structured_llm.ainvoke(
-            f"Extract all stock ticker symbols from this query. Only return valid ticker symbols (e.g., TSLA, AAPL, NVDA). Return empty list if none found.\n\nQuery: {query}"
-        )
-        if result is None:
-            return []
-        tickers = result.tickers if isinstance(result, TickerList) else (result.get("tickers", []) if isinstance(result, dict) else [])
-        if isinstance(tickers, list):
-            return [t.upper().strip() for t in tickers if t and isinstance(t, str)]
-        return []
-    except Exception as e:
-        logger.error(f"Ticker extraction failed: {e}")
-        return []
+    """Extract ticker symbols from query via LLM function_calling with fallback."""
+    # Always try regex-based extraction first (fast and reliable)
+    regex_tickers = _extract_tickers_regex(query)
+    if regex_tickers:
+        logger.info(f"Regex extracted tickers: {regex_tickers}")
+        return regex_tickers
+
+    # Try LLM-based extraction with retries (MiniMax reasoning mode is inconsistent)
+    for attempt in range(3):
+        try:
+            structured_llm = model.with_structured_output(TickerList, method="function_calling")
+            result = await structured_llm.ainvoke(
+                f"Extract all stock ticker symbols from this query. Only return valid ticker symbols (e.g., TSLA, AAPL, NVDA). Return empty list if none found.\n\nQuery: {query}"
+            )
+            if result is not None:
+                tickers = (
+                    result.tickers if isinstance(result, TickerList)
+                    else (result.get("tickers", []) if isinstance(result, dict) else [])
+                )
+                if isinstance(tickers, list) and tickers:
+                    logger.info(f"LLM extracted tickers (attempt {attempt + 1}): {tickers}")
+                    return [t.upper().strip() for t in tickers if t and isinstance(t, str)]
+        except Exception as e:
+            logger.warning(f"Ticker extraction attempt {attempt + 1} failed: {e}")
+
+    logger.warning("All ticker extraction attempts returned empty")
+    return []

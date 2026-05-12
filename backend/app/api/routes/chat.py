@@ -59,6 +59,7 @@ async def _run_graph(initial_state: dict) -> None:
 
         await queue.put({
             "type": "done",
+            "answer_markdown": result.get("answer_markdown", ""),
             "structured_data": result.get("structured_data", {"assets": []}),
             "citations": result.get("citations", []),
             "session_id": result.get("session_id", ""),
@@ -100,11 +101,11 @@ async def chat(request: ChatRequest, db: Session = Depends(get_db)):
 
                 elif item_type == "done":
                     yield f"event: structured_data\ndata: {json.dumps(item['structured_data'])}\n\n"
-                    yield f"event: citations\ndata: {json.dumps(item['citations'])}\n\n"
+                    yield f"event: citations\ndata: {json.dumps({'citations': item['citations']})}\n\n"
                     yield f"event: done\ndata: {json.dumps({'session_id': item['session_id']})}\n\n"
 
                     # Persist messages
-                    final_answer = initial_state.get("answer_markdown", "")
+                    final_answer = item.get("answer_markdown", "")
                     final_structured = item.get("structured_data", {})
                     final_citations = item.get("citations", [])
                     session_service.persist_chat_turn(

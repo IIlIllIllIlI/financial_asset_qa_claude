@@ -9,8 +9,8 @@ class Settings(BaseSettings):
     minimax_base_url: str = "https://api.minimaxi.com/v1"
     minimax_model: str = "MiniMax-M2.7"
     tavily_api_key: str
-    sqlite_path: str = "./backend/data/sqlite.db"
-    chroma_path: str = "./backend/chroma_db/"
+    sqlite_path: str = "./data/sqlite.db"
+    chroma_path: str = "./chroma_db/"
     embedding_model: str = "BAAI/bge-small-zh-v1.5"
 
     model_config = {

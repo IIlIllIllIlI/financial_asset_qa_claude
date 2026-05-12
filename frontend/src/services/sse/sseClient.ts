@@ -1,6 +1,22 @@
 import type { SSEEvent } from "@/types/chat";
 import type { AssetData, Citation, ChatRequest } from "@/types/api";
 
+let tokenBuffer = "";
+function resetThinkingBuffer() { tokenBuffer = ""; }
+function stripThinking(content: string): string {
+  tokenBuffer += content;
+  // Remove complete <think>...</think> blocks
+  const cleaned = tokenBuffer.replace(/<think>[\s\S]*?<\/think>/g, "");
+  // If there's an unclosed <think>, only take content before it
+  const openIdx = cleaned.indexOf("<think>");
+  if (openIdx !== -1) {
+    return ""; // wait for closing tag
+  }
+  const emitted = cleaned;
+  tokenBuffer = "";
+  return emitted;
+}
+
 type SSECallback = {
   onStatus?: (node: string, status: string) => void;
   onToken?: (content: string) => void;
@@ -65,6 +81,7 @@ export async function streamChat(
   const reader = res.body!.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  resetThinkingBuffer();
 
   try {
     while (true) {
@@ -84,10 +101,10 @@ export async function streamChat(
             callbacks.onToken?.(event.content || "");
             break;
           case "structured_data":
-            callbacks.onStructuredData?.(event.structured_data || { assets: [] });
+            callbacks.onStructuredData?.({ assets: (event as Record<string, unknown>).assets as AssetData[] || [] });
             break;
           case "citations":
-            callbacks.onCitations?.(event.citations || []);
+            callbacks.onCitations?.((event as unknown as { citations: Citation[] }).citations || []);
             break;
           case "done":
             callbacks.onDone?.(event.session_id || "");

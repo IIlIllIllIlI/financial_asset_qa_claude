@@ -138,6 +138,7 @@ async def generation_node(state: GraphState) -> GraphState:
     try:
         full_response = ""
         queue_ref = queue
+        stream_buffer = ""
 
         async for event in model.astream_events(messages, version="v2"):
             kind = event.get("event", "")
@@ -145,10 +146,24 @@ async def generation_node(state: GraphState) -> GraphState:
                 chunk = event["data"]["chunk"]
                 if chunk.content:
                     token = chunk.content
-                    # Stream raw tokens for SSE (thinking tags filtered on client side)
                     full_response += token
+
                     if queue_ref:
-                        await queue_ref.put({"type": "token", "content": token})
+                        stream_buffer += token
+                        # Strip complete <think>...</think> blocks from buffer
+                        cleaned = strip_thinking(stream_buffer)
+                        # Only emit if we have clean content AND no unclosed <think> tag
+                        last_open = stream_buffer.rfind("<think>")
+                        last_close = stream_buffer.rfind("</think>")
+                        if last_open <= last_close and cleaned:
+                            await queue_ref.put({"type": "token", "content": cleaned})
+                            stream_buffer = ""
+
+        # Emit remaining buffer after stripping
+        if stream_buffer and queue_ref:
+            cleaned = strip_thinking(stream_buffer)
+            if cleaned:
+                await queue_ref.put({"type": "token", "content": cleaned})
 
         # Strip thinking tags from the final answer
         clean_response = strip_thinking(full_response)

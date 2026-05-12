@@ -6,6 +6,7 @@ from app.providers.openai_provider import get_llm_provider
 from app.repositories.session_repository import SessionRepository
 from app.utils.prompt_loader import load_prompt
 from app.utils.logger import setup_logger
+from app.utils.text import strip_thinking
 
 logger = setup_logger("services.title")
 
@@ -29,12 +30,13 @@ async def generate_and_update_title(
         result = await model.ainvoke(prompt)
 
         title = result.content.strip() if hasattr(result, "content") else str(result).strip()
+        title = strip_thinking(title)
         title = title[:15] if len(title) > 15 else title
 
         if not title:
             title = "新对话"
 
-        db = next(db_session_factory())
+        db = db_session_factory()()
         try:
             repo = SessionRepository(db)
             repo.update_title(session_id, title)
