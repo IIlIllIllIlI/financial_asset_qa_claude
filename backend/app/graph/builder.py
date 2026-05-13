@@ -46,7 +46,7 @@ def create_graph() -> StateGraph:
         route_by_intent,
         {
             "market": "market_data",
-            "query_rewriter": "query_rewriter",
+            "rag": "query_rewriter",
             "hybrid": "market_data",
             "unsupported": "rejection",
         },
@@ -64,7 +64,7 @@ def create_graph() -> StateGraph:
         route_after_extract,
         {
             "market": "generation",
-            "query_rewriter": "query_rewriter",
+            "rag": "query_rewriter",
         },
     )
 
