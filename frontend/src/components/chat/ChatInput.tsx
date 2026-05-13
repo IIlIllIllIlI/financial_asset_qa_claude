@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useRef, useCallback, KeyboardEvent } from "react";
+import { useChatStore } from "@/stores/chatStore";
 
 interface ChatInputProps {
   onSend: (query: string) => void;
@@ -10,6 +11,8 @@ interface ChatInputProps {
 export function ChatInput({ onSend, disabled }: ChatInputProps) {
   const [value, setValue] = useState("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const useStreaming = useChatStore((s) => s.useStreaming);
+  const setUseStreaming = useChatStore((s) => s.setUseStreaming);
 
   const handleSend = useCallback(() => {
     const trimmed = value.trim();
@@ -56,6 +59,26 @@ export function ChatInput({ onSend, disabled }: ChatInputProps) {
         >
           发送
         </button>
+      </div>
+      <div className="flex justify-end mt-2">
+        <label className="flex items-center gap-1.5 text-xs text-gray-500 dark:text-gray-400 cursor-pointer select-none">
+          <span>{useStreaming ? "流式" : "非流式"}</span>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={useStreaming}
+            onClick={() => setUseStreaming(!useStreaming)}
+            className={`relative inline-flex h-4 w-8 items-center rounded-full transition-colors ${
+              useStreaming ? "bg-blue-600" : "bg-gray-400"
+            }`}
+          >
+            <span
+              className={`inline-block h-3 w-3 transform rounded-full bg-white transition-transform ${
+                useStreaming ? "translate-x-4" : "translate-x-0.5"
+              }`}
+            />
+          </button>
+        </label>
       </div>
     </div>
   );
