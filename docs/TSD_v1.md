@@ -114,7 +114,7 @@ During development and testing, all LLM tasks use **MiniMax-M2.7**:
 | Task | Model | Method |
 |---|---|---|
 | Intent Classification | MiniMax-M2.7 | function_calling |
-| Ticker Extraction | MiniMax-M2.7 | function_calling |
+| Ticker Extraction | MiniMax-M2.7 | function_calling (two-phase: direct + Tavily search) |
 | Response Generation | MiniMax-M2.7 | chat completion + streaming |
 | Merge (Hybrid Flow) | MiniMax-M2.7 | chat completion |
 | Title Generation | MiniMax-M2.7 | chat completion |
@@ -453,8 +453,14 @@ intent_result = model.with_structured_output(
 ```
 
 The LLM directly classifies the intent — no confidence threshold is needed. The intent
-determines the graph route. Ticker extraction is a **separate** LLM call performed
-inside market_node (not part of intent classification).
+determines the graph route. Ticker extraction is a **separate two-phase process** inside market_node
+(not part of intent classification):
+1. **Phase 1 (Decision):** LLM with `TickerDecision` schema decides `action="direct"`
+   (confidently maps company/product to ticker) or `action="search"` (uncertain,
+   provides a Chinese search query)
+2. **Phase 2 (Search → Extract):** Only triggered when `action="search"` — backend
+   runs Tavily search with the LLM-provided query, then LLM with `TickerList`
+   schema extracts tickers from the search results. Cannot loop back.
 
 Intent examples:
 - **market**: "特斯拉当前股价是多少？", "显示苹果的市值和市盈率", "英伟达这周股价表现如何？"
@@ -470,8 +476,14 @@ Intent examples:
 User Query → Intent Node (routes to "market")
     ↓
 Market Data Tool Node (market_node)
-    ├── Ticker Extraction: LLM function_calling extracts ticker symbols (separate
-    │   from intent classification — dedicated LLM call with TickerList schema)
+    ├── Phase 0 — Regex + Chinese Name Mapping: fast path, no LLM
+    │   (matches uppercase tickers + known Chinese company names in _CN_NAME_TO_TICKER)
+    ├── Phase 1 — LLM Decision (TickerDecision schema): action="direct"
+    │   (confident mapping → output tickers) or action="search" (uncertain → output
+    │   Chinese search query, e.g. "微信 母公司 股票代码")
+    ├── Phase 2 — Tavily Search + LLM Extract (TickerList schema): only triggered
+    │   by action="search". Runs one Tavily search, feeds results to LLM for ticker
+    │   extraction. Cannot loop back — schema structurally prevents another search
     ├── Data Fetching: for each ticker, fetch price + history from Yahoo Finance
     │   (multi-asset = asyncio.gather for parallel fetching)
     ├── Normalize + cache results per ticker (TTLCache, 60s TTL)
@@ -561,12 +573,10 @@ Stream to Frontend via SSE
 ```
 
 The hybrid flow runs both phases sequentially (market data + news + extract first, then RAG).
-Phase 6 (merge) is a **non-streaming LLM call** that synthesizes all gathered context —
-market metrics, news articles, extracted article full text, and retrieved document chunks —
-into a single coherent summary context. This condensed summary is then passed to the
-generation_node. The merge_node output is NOT sent to the frontend — only the
-generation_node's tokens are streamed to the user. The synthesis cost is one extra
-LLM call but results in much better response quality for complex hybrid queries.
+All gathered raw data — market metrics, news articles, extracted article full text, and
+retrieved document chunks — is passed directly to generation_node for the final answer.
+No intermediate LLM-based summarization step; the generation prompt includes all first-hand
+data to preserve information fidelity.
 
 Example hybrid query:
 
@@ -601,8 +611,9 @@ The system supports queries involving multiple stock tickers (e.g., "Compare TSL
 
 ### Backend
 
-- **Ticker Extraction:** The market_data node uses LLM function calling to extract all
-  ticker symbols from the query into `state["tickers"]`.
+- **Ticker Extraction:** Two-phase: regex+mapping (fast path) → LLM `TickerDecision`
+  (direct or search). If LLM requests search, Tavily runs once, then LLM extracts tickers
+  from results via `TickerList` schema.
 - **Data Fetching:** Yahoo Finance data is fetched **in parallel** for all tickers
   via `asyncio.gather(asyncio.to_thread(...) for each ticker)`. Results are stored
   in `state["market_data"]` keyed by symbol.
@@ -1390,7 +1401,6 @@ Node names sent via status events:
 - `extract` → "Extracting article content..."
 - `retrieval` → "Searching knowledge base..."
 - `rerank` → "Selecting most relevant information..."
-- `merge` → "Synthesizing context..."
 - `generation` → "Generating response..." (briefly shown before first token arrives)
 
 ---
@@ -1930,7 +1940,6 @@ backend/
 │   │   │   ├── extract_node.py      # Tavily Extract full article text
 │   │   │   ├── retrieval_node.py    # Chroma similarity search
 │   │   │   ├── rerank_node.py       # CrossEncoder rerank top-k chunks
-│   │   │   ├── merge_node.py        # LLM synthesize market + news + RAG context (hybrid only)
 │   │   │   ├── generation_node.py   # LLM response generation + token streaming
 │   │   │   ├── formatter_node.py    # Normalize structured_data + citations
 │   │   │   └── rejection_node.py    # Friendly rejection for unsupported queries
@@ -1979,7 +1988,9 @@ backend/
 │   │   │   └── system_prompt.txt    # Main system prompt (Chinese)
 │   │   ├── market/
 │   │   │   ├── market_analysis.txt  # Market analysis prompt template (Chinese)
-│   │   │   └── market_structured.txt
+│   │   │   ├── market_structured.txt
+│   │   │   ├── ticker_decision.txt  # Ticker extraction Phase 1: direct vs search
+│   │   │   └── ticker_from_search.txt # Ticker extraction Phase 2: extract from Tavily
 │   │   ├── rag/
 │   │   │   ├── rag_generation.txt   # RAG-grounded generation prompt (Chinese)
 │   │   ├── formatting/
@@ -2444,7 +2455,6 @@ workflow.add_node("news", news_node)                  # Tavily search
 workflow.add_node("extract", extract_node)            # Tavily Extract full article text
 workflow.add_node("retrieval", retrieval_node)        # Chroma similarity search
 workflow.add_node("rerank", rerank_node)              # Local CrossEncoder rerank
-workflow.add_node("merge", merge_node)                # LLM synthesize market + news + extract + RAG context (hybrid only)
 workflow.add_node("generation", generation_node)      # LLM response generation
 workflow.add_node("formatter", formatter_node)        # Normalize structured_data + citations
 workflow.add_node("rejection", rejection_node)        # Friendly rejection for unsupported
@@ -2457,9 +2467,9 @@ workflow.add_conditional_edges(
     "intent",
     route_by_intent,
     {
-        "market": "market_data",       # market flow
-        "rag": "retrieval",            # RAG flow
-        "hybrid": "market_data",       # hybrid starts with market data, then RAG
+        "market": "market_data",            # market flow
+        "query_rewriter": "query_rewriter",  # RAG flow
+        "hybrid": "market_data",            # hybrid starts with market data, then RAG
         "unsupported": "rejection",
     }
 )
@@ -2483,18 +2493,8 @@ workflow.add_conditional_edges(
 # retrieval → rerank (shared by rag and hybrid flows)
 workflow.add_edge("retrieval", "rerank")
 
-# After rerank: rag → generation, hybrid → merge
-workflow.add_conditional_edges(
-    "rerank",
-    route_after_rerank,
-    {
-        "rag": "generation",
-        "hybrid": "merge",
-    }
-)
-
-# merge → generation (hybrid only path)
-workflow.add_edge("merge", "generation")
+# rerank → generation (both rag and hybrid paths converge here)
+workflow.add_edge("rerank", "generation")
 
 # generation → formatter → END (all flows)
 workflow.add_edge("generation", "formatter")
@@ -2535,14 +2535,6 @@ def route_after_extract(state: GraphState) -> str:
     return "market"  # market flow → generation
 
 
-def route_after_rerank(state: GraphState) -> str:
-    """After rerank node: rag goes to generation, hybrid goes to merge."""
-    if state.get("error"):
-        return "rag"  # will go to generation which skips on error
-    intent = state["intent"]
-    if intent == "hybrid":
-        return "hybrid"
-    return "rag"  # rag flow → generation
 ```
 
 **Fail-fast in nodes**: Each node checks `if state.get("error"): return state` at the start and skips all work if an error is already present. This ensures errors propagate through the graph without further processing.
@@ -2611,8 +2603,15 @@ async def classify_intent(
 File: `tools/market_data_tool.py`
 
 Responsibilities:
-- **Ticker extraction**: LLM function_calling extracts ticker symbols from user query
-  (separate from intent classification — dedicated LLM call inside market_node)
+- **Ticker extraction (two-phase):** Three layers:
+  1. *Phase 0 (regex + Chinese name mapping):* fast path, no LLM — matches uppercase
+     tickers and known Chinese company names in `_CN_NAME_TO_TICKER` dict
+  2. *Phase 1 (LLM Decision):* `TickerDecision` schema — LLM chooses `action="direct"`
+     (confident mapping → output tickers) or `action="search"` (uncertain → output
+     Chinese search query)
+  3. *Phase 2 (Tavily Search + Extract):* only triggered by `action="search"` — backend
+     runs single Tavily search, then LLM with `TickerList` schema extracts tickers from
+     results. Structurally cannot loop (Phase 2 schema has no `action` field)
 - fetch real-time stock price via `yfinance.Ticker(symbol).info`
 - fetch historical data via `yfinance.Ticker(symbol).history(period="30d")`
 - normalize output to standard dict format
@@ -2625,8 +2624,13 @@ Typed interfaces:
 class TickerList(BaseModel):
     tickers: list[str]
 
+class TickerDecision(BaseModel):
+    action: Literal["direct", "search"]
+    tickers: list[str] = []
+    search_query: str = ""
+
 async def extract_tickers(query: str, model) -> list[str]:
-    """Extract ticker symbols from query via LLM function_calling."""
+    """Two-phase: regex → LLM TickerDecision → (optional) Tavily search → TickerList."""
 
 async def fetch_market_data(symbol: str) -> dict:
     """Returns normalized market data or raises MarketDataError.
@@ -2844,7 +2848,7 @@ MINIMAX_MODEL=gpt-4o
 ```text
 prompts/
 ├── system/          # Main system prompt
-├── market/          # Market analysis prompts
+├── market/          # Market analysis + ticker extraction prompts
 ├── rag/             # RAG generation prompt
 ├── formatting/      # Structured output formatting prompts
 ├── intent/          # Intent classification prompt
@@ -3968,7 +3972,7 @@ Critical graph behaviors:
 ```text
 - market route: intent="market" → market_node → news_node → extract_node → generation_node → formatter_node
 - rag route: intent="rag" → retrieval_node → rerank_node → generation_node → formatter_node
-- hybrid route: intent="hybrid" → market_node → news_node → extract_node → retrieval_node → rerank_node → merge_node → generation_node → formatter_node
+- hybrid route: intent="hybrid" → market_node → news_node → extract_node → query_rewriter_node → retrieval_node → rerank_node → generation_node → formatter_node
 - unsupported route: intent="unsupported" → rejection_node → END
 - rerank execution: 8 chunks in → 4 chunks out
 - formatter execution: structured_data normalized, citations assembled
@@ -4728,17 +4732,16 @@ intent → market_data → news → extract → generation → formatter → END
 
 Intent: rag
 ━━━━━━━━━━━━━━━━━
-intent → retrieval → rerank → generation → formatter → END
+intent → query_rewriter → retrieval → rerank → generation → formatter → END
 
-Intent: hybrid (sequential: market first, then RAG, then merge)
+Intent: hybrid (sequential: market first, then RAG)
 ━━━━━━━━━━━━━━━━━
-intent → market_data → news → extract → retrieval → rerank → merge → generation → formatter → END
+intent → market_data → news → extract → query_rewriter → retrieval → rerank → generation → formatter → END
 
 Note: Hybrid runs phases sequentially (not in parallel).
      - Phase 1: market_data + news + extract (sets state["market_data"], state["news_data"], state["extracted_articles"])
-     - Phase 2: retrieval + rerank (sets state["retrieved_docs"], state["reranked_docs"])
-     - Merge: LLM synthesizes all context (market + news + extracted articles + RAG chunks)
-     - Generation: LLM generates final markdown answer from the merged context
+     - Phase 2: query_rewriter + retrieval + rerank (sets state["rewritten_query"], state["retrieved_docs"], state["reranked_docs"])
+     - Generation: LLM generates final markdown answer from all raw context (market + news + articles + RAG docs)
 
 Intent: unsupported
 ━━━━━━━━━━━━━━━━━

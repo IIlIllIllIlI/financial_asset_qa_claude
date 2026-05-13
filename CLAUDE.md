@@ -64,16 +64,15 @@
 ### LangGraph 流程图（10 节点）
 
 ```
-ENTRY → intent ──→ market_data → news → extract ──→ generation → formatter → END
-              │                                                    ↑
-              ├──→ retrieval → rerank ─────────────────────────────┤
-              │                                                    ↑
-              ├──→ (hybrid: 两条路径汇合) ──→ merge ───────────────┘
-              │
-              └──→ (unsupported) → rejection → END
+               ┌─→ market_data → news → extract ─────────────┐
+ENTRY → intent ─┼─→ query_rewriter → retrieval → rerank ──────┼─→ generation → formatter → END
+               │                                      ↑       │
+               └─→ (hybrid: 串行执行两路) ────────────┘       │
+               │                                              │
+               └─→ (unsupported) → rejection → END
 ```
 
-- **条件路由**：`edges/router.py` 三个路由函数根据 `intent` 决定路径
+- **条件路由**：`edges/router.py` 中 `route_by_intent`、`route_after_extract` 两个路由函数根据 `intent` 决定路径
 - **故障快速传递**：每个节点首行检查 `state.get("error")`，有错则跳过
 - **SSE 流式**：`_token_queue`（asyncio.Queue）连接 LangGraph 节点和 SSE 响应
 
@@ -110,7 +109,7 @@ generation_node → queue.put({type: "token", content: "..."})
 ### 已知陷阱
 - **LangGraph `ainvoke` 不修改输入 state**：返回新的 result dict，不要从 `initial_state` 读取图执行后的结果
 - **SSE 解析器扁平化**：`parseSSEEvents` 把 JSON data spread 到 event 对象，访问 `event.structured_data` 是 undefined，应访问 `event.assets`
-- **MiniMax `<think>` 标签**：reasoning 模型输出 `<think>...</think>`，后端 `strip_thinking()` + 前端 `stripThinking()` 均需过滤
+- **MiniMax `<think>` 标签**：reasoning 模型输出 `<think>...</think>`，由 `openai_provider.py` 中的 `_ThinkStrippedModel` 包装器统一剥离，所有 LLM 调用路径自动生效，调用方无需处理
 - **`sessionmaker` 不是迭代器**：`db_session_factory()` 返回 sessionmaker 对象，调用它获取 session → `db_session_factory()()`
 
 ## 环境变量
