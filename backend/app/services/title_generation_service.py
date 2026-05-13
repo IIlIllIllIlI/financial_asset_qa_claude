@@ -13,16 +13,11 @@ logger = setup_logger("services.title")
 async def generate_and_update_title(
     session_id: str,
     user_query: str,
-    response_content: str,
     db_session_factory,
 ):
-    """Generate title via LLM and update session in DB (fire-and-forget)."""
+    """Generate title via LLM and update session in DB."""
     try:
-        summary = response_content[:200] if response_content else user_query[:100]
-
-        prompt_template = load_prompt("title/title_generation.txt")
-        prompt = prompt_template.replace("{user_query}", user_query)
-        prompt = prompt.replace("{response_summary}", summary)
+        prompt = load_prompt("title/title_generation.txt").replace("{user_query}", user_query)
 
         provider = get_llm_provider()
         model = provider.get_model()

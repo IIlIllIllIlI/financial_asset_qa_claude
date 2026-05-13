@@ -1679,23 +1679,20 @@ The frontend does NOT call Yahoo Finance directly — all data flows through the
 After the first user query in a new session:
 
 ```text
-1. Persist user message + assistant response
-2. Fire-and-forget via FastAPI BackgroundTasks:
-   LLM (MiniMax-M2.7) with Chinese prompt:
-   "根据以下对话，生成一个简短的标题（不超过15个中文字）：
-    用户问题：{user_query}
-    助手回答摘要：{response_summary}"
-3. PATCH /api/sessions/{id}/title to update session title in SQLite
-4. Frontend observes title update via TanStack Query cache invalidation
+1. Title generation task starts concurrently with LangGraph execution
+2. LLM (MiniMax-M2.7) generates title from user query only:
+   "根据用户问题，生成一个简短的对话标题（不超过15个中文字）：
+    用户问题：{user_query}"
+3. Graph completes → await title task → title written to SQLite
+4. done SSE event sent → frontend invalidates → fetches correct title
 ```
 
-Title generation is a fire-and-forget background task — the user's chat response
-is never delayed by title generation. If title generation fails, the title
-remains permanently as "新对话" (no retry mechanism). The user can manually
-rename via PATCH if desired.
+Title generation runs in parallel with the graph — in most cases it finishes
+before or at the same time as the graph, adding no extra latency. Only the
+user query is needed (no response summary), since the query alone contains
+enough topic information for a concise title.
 
-The `{response_summary}` is the first ~200 characters of the assistant's response
-(truncated, not a separate LLM call) — sufficient for the LLM to understand the topic.
+If title generation fails, the title defaults to "新对话".
 
 Example titles (all Chinese):
 
@@ -1966,7 +1963,7 @@ backend/
 │   │   ├── session_service.py       # Session lifecycle + title generation
 │   │   ├── rag_service.py           # Document parsing, chunking, ingestion orchestration
 │   │   ├── streaming_service.py     # SSE event formatting + lifecycle
-│   │   └── title_generation_service.py  # Async LLM title generation
+│   │   └── title_generation_service.py  # LLM title generation (runs concurrent with graph)
 │
 │   ├── database/
 │   │   ├── base.py                  # SQLAlchemy Base
@@ -4707,7 +4704,7 @@ maintain consistency with the rest of the codebase.
 | Timestamp format | UTC ISO 8601 |
 | Error format | SSE error event: `{"error": {"type": "...", "message": "..."}}` |
 | yfinance integration | `asyncio.to_thread()` wrapper for sync calls |
-| Title generation | FastAPI BackgroundTasks (fire-and-forget), LLM generates Chinese title ≤15 chars |
+| Title generation | Runs concurrent with graph, awaited before done event. Uses user query only. ≤15 chars |
 | Title update endpoint | PATCH /api/sessions/{id}/title |
 | Default session title | "新对话" |
 | Backend package root | `backend/app/` (with `app/` package) |

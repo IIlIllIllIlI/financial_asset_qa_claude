@@ -87,7 +87,19 @@ async def chat(request: ChatRequest, db: Session = Depends(get_db)):
         initial_state = _build_initial_state(request, messages, token_queue)
 
         async def event_stream():
-            task = asyncio.create_task(_run_graph(initial_state))
+            graph_task = asyncio.create_task(_run_graph(initial_state))
+
+            # Start title generation concurrently with graph execution
+            msg_count = len(session_service.message_repo.get_by_session_id(request.session_id))
+            title_task: asyncio.Task | None = None
+            if msg_count <= 2:
+                title_task = asyncio.create_task(
+                    generate_and_update_title(
+                        request.session_id,
+                        request.query,
+                        get_session_factory,
+                    )
+                )
 
             while True:
                 item = await token_queue.get()
@@ -100,10 +112,6 @@ async def chat(request: ChatRequest, db: Session = Depends(get_db)):
                     yield f"event: token\ndata: {json.dumps({'content': item['content']})}\n\n"
 
                 elif item_type == "done":
-                    yield f"event: structured_data\ndata: {json.dumps(item['structured_data'])}\n\n"
-                    yield f"event: citations\ndata: {json.dumps({'citations': item['citations']})}\n\n"
-                    yield f"event: done\ndata: {json.dumps({'session_id': item['session_id']})}\n\n"
-
                     # Persist messages
                     final_answer = item.get("answer_markdown", "")
                     final_structured = item.get("structured_data", {})
@@ -115,18 +123,16 @@ async def chat(request: ChatRequest, db: Session = Depends(get_db)):
                         {"structured_data": final_structured, "citations": final_citations},
                     )
 
-                    # Fire-and-forget title generation if this is the first message
-                    msg_count = len(session_service.message_repo.get_by_session_id(request.session_id))
-                    if msg_count <= 2:  # Only this turn exists
-                        asyncio.create_task(
-                            generate_and_update_title(
-                                request.session_id,
-                                request.query,
-                                final_answer,
-                                get_session_factory,
-                            )
-                        )
+                    # Await title generation to guarantee it completes before done event
+                    if title_task is not None:
+                        try:
+                            await title_task
+                        except Exception as e:
+                            logger.error(f"Title generation failed: {e}")
 
+                    yield f"event: structured_data\ndata: {json.dumps(item['structured_data'])}\n\n"
+                    yield f"event: citations\ndata: {json.dumps({'citations': item['citations']})}\n\n"
+                    yield f"event: done\ndata: {json.dumps({'session_id': item['session_id']})}\n\n"
                     break
 
                 elif item_type == "error":
@@ -134,7 +140,7 @@ async def chat(request: ChatRequest, db: Session = Depends(get_db)):
                     yield f"event: error\ndata: {json.dumps({'error': error_info})}\n\n"
                     break
 
-            await task
+            await graph_task
 
         return StreamingResponse(
             event_stream(),
@@ -178,14 +184,14 @@ async def chat(request: ChatRequest, db: Session = Depends(get_db)):
 
     msg_count = len(session_service.message_repo.get_by_session_id(request.session_id))
     if msg_count <= 2:
-        asyncio.create_task(
-            generate_and_update_title(
+        try:
+            await generate_and_update_title(
                 request.session_id,
                 request.query,
-                answer,
                 get_session_factory,
             )
-        )
+        except Exception as e:
+            logger.error(f"Title generation failed: {e}")
 
     return ChatResponse(
         answer_markdown=answer,
