@@ -2,9 +2,9 @@
  * Verify streaming tokens render through direct backend fetch.
  * The key fix: bypassing Next.js rewrites proxy which buffered SSE.
  */
-import { test, expect } from "@playwright/test";
+import { test, expect, Page, Locator } from "@playwright/test";
 
-async function createSessionRetry(page: typeof import("@playwright/test").Page) {
+async function createSessionRetry(page: Page): Promise<Locator> {
   for (let i = 0; i < 5; i++) {
     await page.getByRole("button", { name: /新对话/ }).click();
     try {
@@ -16,6 +16,7 @@ async function createSessionRetry(page: typeof import("@playwright/test").Page) 
       await page.waitForTimeout(2000);
     }
   }
+  throw new Error("Failed to create session after 5 attempts");
 }
 
 test("direct fetch bypasses proxy - streaming works", async ({ page }) => {
