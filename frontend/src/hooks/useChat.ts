@@ -82,6 +82,15 @@ export function useChat() {
               onDone: () => {
                 store.setIsStreaming(false);
                 invalidateSession();
+                // Title generation is async fire-and-forget on the backend,
+                // runs after the SSE stream closes. Schedule delayed refetches
+                // to catch the updated title when it lands (typically 3-8s).
+                [3000, 6000, 10000].forEach((delay) => {
+                  setTimeout(
+                    () => queryClient.invalidateQueries({ queryKey: ["sessions"] }),
+                    delay
+                  );
+                });
               },
               onError: (error) => {
                 store.setError(error);
