@@ -4,7 +4,6 @@ from app.graph.state import GraphState
 from app.providers.openai_provider import get_llm_provider
 from app.utils.prompt_loader import load_prompt
 from app.utils.logger import setup_logger
-from app.utils.text import strip_thinking
 
 logger = setup_logger("graph.nodes.rejection")
 
@@ -35,9 +34,8 @@ async def rejection_node(state: GraphState) -> GraphState:
                     if queue:
                         await queue.put({"type": "token", "content": chunk.content})
 
-        cleaned = strip_thinking(full_response)
-        state["answer_markdown"] = cleaned
-        state["final_response"] = cleaned
+        state["answer_markdown"] = full_response
+        state["final_response"] = full_response
         state["structured_data"] = {"assets": []}
         state["citations"] = []
         logger.info("Rejection response generated")

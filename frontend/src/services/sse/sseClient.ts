@@ -1,22 +1,6 @@
 import type { SSEEvent } from "@/types/chat";
 import type { AssetData, Citation, ChatRequest } from "@/types/api";
 
-let tokenBuffer = "";
-function resetThinkingBuffer() { tokenBuffer = ""; }
-function stripThinking(content: string): string {
-  tokenBuffer += content;
-  // Remove complete <think>...</think> blocks
-  const cleaned = tokenBuffer.replace(/<think>[\s\S]*?<\/think>/g, "");
-  // If there's an unclosed <think>, only take content before it
-  const openIdx = cleaned.indexOf("<think>");
-  if (openIdx !== -1) {
-    return ""; // wait for closing tag
-  }
-  const emitted = cleaned;
-  tokenBuffer = "";
-  return emitted;
-}
-
 type SSECallback = {
   onStatus?: (node: string, status: string) => void;
   onToken?: (content: string) => void;
@@ -89,7 +73,6 @@ export async function streamChat(
   const reader = res.body!.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
-  resetThinkingBuffer();
 
   try {
     while (true) {

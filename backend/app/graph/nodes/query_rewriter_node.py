@@ -3,7 +3,6 @@
 from app.graph.state import GraphState
 from app.providers.openai_provider import get_llm_provider
 from app.utils.prompt_loader import load_prompt
-from app.utils.text import strip_thinking
 from app.utils.logger import setup_logger
 
 logger = setup_logger("graph.nodes.query_rewriter")
@@ -41,8 +40,7 @@ async def query_rewriter_node(state: GraphState) -> GraphState:
 
         provider = get_llm_provider()
         result = await provider.chat([{"role": "user", "content": prompt}])
-        raw = result.content.strip() if hasattr(result, "content") else str(result).strip()
-        rewritten = strip_thinking(raw)
+        rewritten = result.content.strip() if hasattr(result, "content") else str(result).strip()
 
         if rewritten:
             state["rewritten_query"] = rewritten

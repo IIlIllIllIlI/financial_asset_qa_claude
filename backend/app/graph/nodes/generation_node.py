@@ -6,7 +6,6 @@ from app.graph.state import GraphState
 from app.providers.openai_provider import get_llm_provider
 from app.utils.prompt_loader import load_prompt
 from app.utils.logger import setup_logger
-from app.utils.text import strip_thinking
 
 logger = setup_logger("graph.nodes.generation")
 
@@ -137,8 +136,6 @@ async def generation_node(state: GraphState) -> GraphState:
 
     try:
         full_response = ""
-        queue_ref = queue
-        stream_buffer = ""
 
         async for event in model.astream_events(messages, version="v2"):
             kind = event.get("event", "")
@@ -148,32 +145,15 @@ async def generation_node(state: GraphState) -> GraphState:
                     token = chunk.content
                     full_response += token
 
-                    if queue_ref:
-                        stream_buffer += token
-                        # Strip complete <think>...</think> blocks from buffer
-                        cleaned = strip_thinking(stream_buffer)
-                        # Only emit if we have clean content AND no unclosed <think> tag
-                        last_open = stream_buffer.rfind("<think>")
-                        last_close = stream_buffer.rfind("</think>")
-                        if last_open <= last_close and cleaned:
-                            await queue_ref.put({"type": "token", "content": cleaned})
-                            stream_buffer = ""
+                    if queue:
+                        await queue.put({"type": "token", "content": token})
 
-        # Emit remaining buffer after stripping
-        if stream_buffer and queue_ref:
-            cleaned = strip_thinking(stream_buffer)
-            if cleaned:
-                await queue_ref.put({"type": "token", "content": cleaned})
+        state["answer_markdown"] = full_response
 
-        # Strip thinking tags from the final answer
-        clean_response = strip_thinking(full_response)
-        state["answer_markdown"] = clean_response
-
-        # Extract citations from cleaned markdown
         reranked_docs = state.get("reranked_docs", [])
-        state["citations"] = _extract_citations_from_markdown(clean_response, reranked_docs)
+        state["citations"] = _extract_citations_from_markdown(full_response, reranked_docs)
 
-        logger.info(f"Generation complete: {len(clean_response)} chars, {len(state['citations'])} citations")
+        logger.info(f"Generation complete: {len(full_response)} chars, {len(state['citations'])} citations")
     except Exception as e:
         logger.error(f"Generation failed: {e}")
         state["error"] = {"type": "LLMError", "message": str(e)}
