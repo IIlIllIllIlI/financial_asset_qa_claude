@@ -46,18 +46,15 @@ def _build_context(state: GraphState) -> str:
                 context_parts.append(content)
 
     if intent in ("rag", "hybrid"):
-        if intent == "hybrid" and state.get("_merged_context"):
-            context_parts.append(f"\n## 综合摘要\n{state['_merged_context']}")
+        docs = state.get("reranked_docs", [])
+        if docs:
+            context_parts.append("\n## 知识库内容")
+            for i, doc in enumerate(docs):
+                meta = doc.get("metadata", {})
+                doc_name = meta.get("document_name", f"文档{i+1}")
+                context_parts.append(f"**来源: {doc_name}**\n{doc.get('content', '')}")
         else:
-            docs = state.get("reranked_docs", [])
-            if docs:
-                context_parts.append("\n## 知识库内容")
-                for i, doc in enumerate(docs):
-                    meta = doc.get("metadata", {})
-                    doc_name = meta.get("document_name", f"文档{i+1}")
-                    context_parts.append(f"**来源: {doc_name}**\n{doc.get('content', '')}")
-            else:
-                context_parts.append("\n知识库中未找到相关文档。")
+            context_parts.append("\n知识库中未找到相关文档。")
 
     return "\n\n".join(context_parts)
 

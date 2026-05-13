@@ -27,11 +27,3 @@ def route_after_extract(state: GraphState) -> str:
     return "market"
 
 
-def route_after_rerank(state: GraphState) -> str:
-    """After rerank: rag → generation, hybrid → merge."""
-    if state.get("error"):
-        return "rag"
-    intent = state.get("intent", "")
-    if intent == "hybrid":
-        return "hybrid"
-    return "rag"
