@@ -26,36 +26,44 @@ type SSECallback = {
   onError?: (error: { type: string; message: string }) => void;
 };
 
-function parseSSEEvents(buffer: string): SSEEvent[] {
+function parseSSEEvents(buffer: string): { events: SSEEvent[]; remainder: string } {
   const events: SSEEvent[] = [];
   const parts = buffer.split("\n\n");
 
-  for (const part of parts) {
+  // Last part may be incomplete — keep it for the next read
+  const complete = parts.slice(0, -1);
+  const remainder = parts[parts.length - 1];
+
+  for (const part of complete) {
     if (!part.trim()) continue;
-    const lines = part.split("\n");
-    let eventType = "";
-    let dataStr = "";
+    const event = _parseSSEPart(part);
+    if (event) events.push(event);
+  }
 
-    for (const line of lines) {
-      if (line.startsWith("event: ")) {
-        eventType = line.slice(7).trim();
-      } else if (line.startsWith("data: ")) {
-        dataStr = line.slice(6);
-      }
-    }
+  return { events, remainder };
+}
 
-    if (eventType && dataStr) {
-      try {
-        const data = JSON.parse(dataStr);
-        const event: SSEEvent = { type: eventType as SSEEvent["type"], ...data };
-        events.push(event);
-      } catch {
-        // skip unparseable
-      }
+function _parseSSEPart(part: string): SSEEvent | null {
+  const lines = part.split("\n");
+  let eventType = "";
+  let dataStr = "";
+
+  for (const line of lines) {
+    if (line.startsWith("event: ")) {
+      eventType = line.slice(7).trim();
+    } else if (line.startsWith("data: ")) {
+      dataStr = line.slice(6);
     }
   }
 
-  return events;
+  if (!eventType || !dataStr) return null;
+
+  try {
+    const data = JSON.parse(dataStr);
+    return { type: eventType as SSEEvent["type"], ...data };
+  } catch {
+    return null;
+  }
 }
 
 export async function streamChat(
@@ -89,8 +97,8 @@ export async function streamChat(
       if (done) break;
 
       buffer += decoder.decode(value, { stream: true });
-      const events = parseSSEEvents(buffer);
-      buffer = ""; // reset buffer after parsing
+      const { events, remainder } = parseSSEEvents(buffer);
+      buffer = remainder; // preserve incomplete events for next read
 
       for (const event of events) {
         switch (event.type) {
@@ -113,6 +121,8 @@ export async function streamChat(
             callbacks.onError?.(event.error || { type: "Unknown", message: "Stream error" });
             break;
         }
+        // Yield to the browser so React can re-render between events
+        await new Promise((resolve) => setTimeout(resolve, 0));
       }
     }
   } finally {
