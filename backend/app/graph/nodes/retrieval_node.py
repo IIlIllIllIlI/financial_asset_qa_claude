@@ -17,7 +17,8 @@ async def retrieval_node(state: GraphState) -> GraphState:
         await queue.put({"type": "status", "node": "retrieval", "status": "running"})
 
     try:
-        chunks = await retrieve_chunks(state["user_query"])
+        query = state.get("rewritten_query") or state["user_query"]
+        chunks = await retrieve_chunks(query)
         state["retrieved_docs"] = chunks
         logger.info(f"Retrieved {len(chunks)} chunks")
     except Exception as e:

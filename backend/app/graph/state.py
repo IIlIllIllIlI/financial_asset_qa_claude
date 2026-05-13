@@ -18,6 +18,7 @@ class GraphState(TypedDict):
     intent: str
 
     # RAG
+    rewritten_query: str
     retrieved_docs: list[dict]
     reranked_docs: list[dict]
 

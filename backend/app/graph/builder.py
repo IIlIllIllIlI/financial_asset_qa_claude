@@ -4,6 +4,7 @@ from langgraph.graph import StateGraph, END
 
 from app.graph.state import GraphState
 from app.graph.nodes.intent_node import intent_node
+from app.graph.nodes.query_rewriter_node import query_rewriter_node
 from app.graph.nodes.market_node import market_node
 from app.graph.nodes.news_node import news_node
 from app.graph.nodes.extract_node import extract_node
@@ -27,6 +28,7 @@ def create_graph() -> StateGraph:
 
     # Register nodes
     workflow.add_node("intent", intent_node)
+    workflow.add_node("query_rewriter", query_rewriter_node)
     workflow.add_node("market_data", market_node)
     workflow.add_node("news", news_node)
     workflow.add_node("extract", extract_node)
@@ -46,7 +48,7 @@ def create_graph() -> StateGraph:
         route_by_intent,
         {
             "market": "market_data",
-            "rag": "retrieval",
+            "query_rewriter": "query_rewriter",
             "hybrid": "market_data",
             "unsupported": "rejection",
         },
@@ -58,15 +60,18 @@ def create_graph() -> StateGraph:
     # news → extract (shared by market and hybrid)
     workflow.add_edge("news", "extract")
 
-    # After extract: market → generation, hybrid → retrieval
+    # After extract: market → generation, hybrid → query_rewriter
     workflow.add_conditional_edges(
         "extract",
         route_after_extract,
         {
             "market": "generation",
-            "hybrid": "retrieval",
+            "query_rewriter": "query_rewriter",
         },
     )
+
+    # query_rewriter → retrieval (both rag and hybrid)
+    workflow.add_edge("query_rewriter", "retrieval")
 
     # retrieval → rerank (shared by rag and hybrid)
     workflow.add_edge("retrieval", "rerank")

@@ -11,7 +11,7 @@ def route_by_intent(state: GraphState) -> str:
     if intent == "market":
         return "market"
     elif intent == "rag":
-        return "rag"
+        return "query_rewriter"
     elif intent == "hybrid":
         return "hybrid"
     return "unsupported"
@@ -23,7 +23,7 @@ def route_after_extract(state: GraphState) -> str:
         return "market"
     intent = state.get("intent", "")
     if intent == "hybrid":
-        return "hybrid"
+        return "query_rewriter"
     return "market"
 
 
