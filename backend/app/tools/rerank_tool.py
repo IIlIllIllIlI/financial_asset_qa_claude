@@ -1,58 +1,44 @@
-"""LLM-based rerank tool."""
+"""Local CrossEncoder rerank tool using BGE-Reranker."""
 
-from pydantic import BaseModel
+import asyncio
 
-from app.providers.openai_provider import get_llm_provider
+from sentence_transformers import CrossEncoder
+
+from app.config.settings import get_settings
 from app.utils.logger import setup_logger
 
 logger = setup_logger("tools.rerank")
 
+_model: CrossEncoder | None = None
 
-class RerankSelection(BaseModel):
-    selected_indices: list[int]
+
+def get_reranker_model() -> CrossEncoder:
+    global _model
+    if _model is None:
+        settings = get_settings()
+        logger.info(f"Loading reranker model: {settings.reranker_model}")
+        _model = CrossEncoder(settings.reranker_model)
+    return _model
 
 
 async def rerank_chunks(query: str, chunks: list[dict], top_n: int = 4) -> list[dict]:
-    """Rerank chunks using LLM. Returns top-n most relevant chunks."""
+    """Rerank chunks using local CrossEncoder. Returns top-n most relevant chunks."""
     if not chunks:
         return []
 
     if len(chunks) <= top_n:
         return chunks
 
-    provider = get_llm_provider()
-
-    chunks_text = "\n\n".join(
-        f"[{i}]\n{chunk['content'][:500]}"
-        for i, chunk in enumerate(chunks)
-    )
-
-    prompt = f"""从以下文档片段中选择与用户问题最相关的{top_n}个。
-
-用户问题：{query}
-
-文档片段：
-{chunks_text}
-
-请输出最相关片段的编号列表（按相关性从高到低排列），例如：[3, 0, 5, 2]
-只输出列表，不要输出其他内容。"""
-
     try:
-        structured_llm = provider.with_structured_output(RerankSelection, method="function_calling")
-        result = await structured_llm.ainvoke(prompt)
+        model = get_reranker_model()
+        pairs = [(query, chunk["content"][:500]) for chunk in chunks]
+        scores = await asyncio.to_thread(model.predict, pairs, show_progress_bar=False)
 
-        if isinstance(result, RerankSelection):
-            indices = result.selected_indices
-        else:
-            indices = result.get("selected_indices", []) if isinstance(result, dict) else []
-
-        selected = []
-        for idx in indices:
-            if isinstance(idx, int) and 0 <= idx < len(chunks):
-                selected.append(chunks[idx])
+        ranked_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+        selected = [chunks[i] for i in ranked_indices[:top_n]]
 
         logger.info(f"Reranked {len(chunks)} → {len(selected)} chunks")
-        return selected[:top_n] if selected else chunks[:top_n]
+        return selected
     except Exception as e:
         logger.error(f"Rerank failed: {e}")
         return chunks[:top_n]

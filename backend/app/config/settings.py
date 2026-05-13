@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     sqlite_path: str = str(_BACKEND_DIR / "data" / "sqlite.db")
     chroma_path: str = str(_BACKEND_DIR / "chroma_db")
     embedding_model: str = "BAAI/bge-small-zh-v1.5"
+    reranker_model: str = "BAAI/bge-reranker-base"
 
     model_config = {
         "env_file": str(_BACKEND_DIR.parent / ".env"),

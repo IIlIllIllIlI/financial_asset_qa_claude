@@ -15,6 +15,7 @@
 | AI 编排 | LangGraph (StateGraph) | 10 节点状态图，条件路由 |
 | LLM | MiniMax M2.7 | OpenAI 兼容 API，reasoning 模型（输出 `<think>` 标签） |
 | 向量检索 | ChromaDB + BGE-small-zh-v1.5 | 本地 CPU 运行，笔记本级延迟 |
+| Rerank | BGE-reranker-base (CrossEncoder) | 本地 CPU 运行，替代 LLM rerank |
 | 数据库 | SQLite + SQLAlchemy ORM | 文件存储：`backend/data/sqlite.db` |
 | 前端框架 | Next.js 16 + React 19 | Turbopack 开发服务器，port 3000 |
 | 状态管理 | TanStack Query + Zustand | 服务端状态 (RQ) + 客户端状态 (Zustand) |
@@ -31,7 +32,7 @@
 │   ├── app/
 │   │   ├── api/routes/        # POST /api/chat (SSE), CRUD /api/sessions, /api/rag/upload
 │   │   ├── graph/             # LangGraph: builder, state, nodes/, edges/, prompts/
-│   │   ├── tools/             # 6 tools: market_data, retrieval, rerank, embedding, tavily_*
+│   │   ├── tools/             # 6 tools: market_data, retrieval, rerank (local CrossEncoder), embedding, tavily_*
 │   │   ├── services/          # rag_service, session_service, title_generation_service
 │   │   ├── models/            # SQLAlchemy: ChatSession, ChatMessage, KnowledgeDocument, IngestionJob
 │   │   ├── repositories/      # 4 CRUD repositories

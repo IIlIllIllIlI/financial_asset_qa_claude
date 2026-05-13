@@ -116,7 +116,6 @@ During development and testing, all LLM tasks use **MiniMax-M2.7**:
 | Intent Classification | MiniMax-M2.7 | function_calling |
 | Ticker Extraction | MiniMax-M2.7 | function_calling |
 | Response Generation | MiniMax-M2.7 | chat completion + streaming |
-| Rerank | MiniMax-M2.7 | chat completion |
 | Merge (Hybrid Flow) | MiniMax-M2.7 | chat completion |
 | Title Generation | MiniMax-M2.7 | chat completion |
 | Unsupported Query Rejection | MiniMax-M2.7 | chat completion |
@@ -194,7 +193,7 @@ LangGraph acts as:
 |--------------------|        |--------------------------|
 | Yahoo Finance      |        | Chroma Vector Search     |
 | Tavily Search      |        | Embedding Retrieval      |
-| Tavily Extract     |        | Lightweight LLM Rerank   |
+| Tavily Extract     |        | Local CrossEncoder Rerank |
 +--------------------+        +--------------------------+
          |                                   |
          +-----------------+-----------------+
@@ -512,8 +511,8 @@ Retrieval Node
     ├── Similarity search in Chroma (top-k = 8)
     └── Return retrieved chunks with metadata (may be empty if no relevant docs)
     ↓
-Lightweight Rerank Node
-    ├── LLM selects best chunks from top-k (output top-4)
+Local CrossEncoder Rerank Node
+    ├── BGE-reranker-base scores each chunk against query (output top-4)
     ├── If retrieval returned no chunks: skip rerank, set empty context
     └── Discard irrelevant chunks
     ↓
@@ -549,7 +548,7 @@ Phase 3: Extract Node (Tavily Extract — top 2 articles)
     ↓
 Phase 4: Retrieval Node (Chroma search)
     ↓
-Phase 5: Rerank Node (LLM selects best chunks)
+Phase 5: Rerank Node (CrossEncoder selects best chunks)
     ↓
 Phase 6: Merge Node (LLM synthesizes all context: market + news + extracted articles + RAG)
     ↓
@@ -860,7 +859,7 @@ class GraphState(TypedDict):
 
     # RAG
     retrieved_docs: list[dict]       # top-k chunks from Chroma (k=8)
-    reranked_docs: list[dict]        # top-N chunks after LLM rerank (N=4)
+    reranked_docs: list[dict]        # top-N chunks after CrossEncoder rerank (N=4)
 
     # Market data
     tickers: list[str]               # detected ticker symbols from query (e.g. ["TSLA", "AAPL"])
@@ -1103,7 +1102,7 @@ Chroma Storage (persist to disk)
     ↓
 Similarity Retrieval (cosine similarity, top-k=8)
     ↓
-Lightweight LLM Rerank (MiniMax-M2.7 selects top-4)
+Local CrossEncoder Rerank (BAAI/bge-reranker-base selects top-4)
     ↓
 Context Builder (assemble final context)
     ↓
@@ -1157,27 +1156,24 @@ The collection is created on first use and persisted to disk under `CHROMA_PATH`
 
 ---
 
-## 12.6 Lightweight Rerank Strategy
+## 12.6 Local CrossEncoder Rerank Strategy
 
-The rerank stage uses:
+The rerank stage uses a local CrossEncoder model:
 
 ```text
-LLM-based reranking (MiniMax-M2.7)
+BAAI/bge-reranker-base (HuggingFace, 278M params)
 ```
 
-Instead of:
-- cross-encoder rerankers
-- heavyweight rerank models
-- additional infrastructure
+Loaded via `sentence_transformers.CrossEncoder`, runs entirely on local CPU — no API calls.
 
 Workflow:
 
 ```text
 Top-8 chunks from Chroma
     ↓
-LLM evaluates each chunk's relevance to query
+CrossEncoder scores each (query, chunk) pair
     ↓
-LLM selects top-4 most relevant chunks
+Sort by relevance score descending, select top-4
     ↓
 Final context assembly (ordered by relevance)
 ```
@@ -1496,7 +1492,7 @@ This includes:
 - web search (Tavily)
 - web content extraction (Tavily Extract)
 - vector retrieval (Chroma)
-- LLM rerank
+- local rerank
 - embedding
 
 ---
@@ -1509,7 +1505,7 @@ tools/
 ├── tavily_search_tool.py    # Tavily Search API wrapper
 ├── tavily_extract_tool.py   # Tavily Extract API wrapper
 ├── retrieval_tool.py        # Chroma vector search
-├── rerank_tool.py           # LLM-based reranking
+├── rerank_tool.py           # Local CrossEncoder reranking
 ├── embedding_tool.py        # Embedding model (BAAI/bge-small)
 └── llm_tool.py              # LLM provider factory (reads config, returns provider)
 ```
@@ -1933,7 +1929,7 @@ backend/
 │   │   │   ├── news_node.py         # Tavily search, set state.news_data
 │   │   │   ├── extract_node.py      # Tavily Extract full article text
 │   │   │   ├── retrieval_node.py    # Chroma similarity search
-│   │   │   ├── rerank_node.py       # LLM rerank top-k chunks
+│   │   │   ├── rerank_node.py       # CrossEncoder rerank top-k chunks
 │   │   │   ├── merge_node.py        # LLM synthesize market + news + RAG context (hybrid only)
 │   │   │   ├── generation_node.py   # LLM response generation + token streaming
 │   │   │   ├── formatter_node.py    # Normalize structured_data + citations
@@ -1948,7 +1944,7 @@ backend/
 │   │   ├── tavily_search_tool.py    # Tavily Search via langchain-tavily TavilySearch
 │   │   ├── tavily_extract_tool.py   # Tavily Extract via langchain-tavily TavilyExtract
 │   │   ├── retrieval_tool.py        # Chroma vector search via langchain-chroma
-│   │   ├── rerank_tool.py           # LLM-based rerank
+│   │   ├── rerank_tool.py           # Local CrossEncoder rerank
 │   │   ├── embedding_tool.py        # BAAI/bge-small via langchain-huggingface
 │   │   └── llm_tool.py              # LLM provider factory (ChatOpenAI for MiniMax)
 │
@@ -1986,9 +1982,6 @@ backend/
 │   │   │   └── market_structured.txt
 │   │   ├── rag/
 │   │   │   ├── rag_generation.txt   # RAG-grounded generation prompt (Chinese)
-│   │   │   └── rag_rerank.txt       # Rerank selection prompt (Chinese)
-│   │   ├── rerank/
-│   │   │   └── rerank_selection.txt
 │   │   ├── formatting/
 │   │   │   └── structured_format.txt
 │   │   ├── intent/
@@ -2450,7 +2443,7 @@ workflow.add_node("market_data", market_node)        # Yahoo Finance + normalize
 workflow.add_node("news", news_node)                  # Tavily search
 workflow.add_node("extract", extract_node)            # Tavily Extract full article text
 workflow.add_node("retrieval", retrieval_node)        # Chroma similarity search
-workflow.add_node("rerank", rerank_node)              # LLM rerank
+workflow.add_node("rerank", rerank_node)              # Local CrossEncoder rerank
 workflow.add_node("merge", merge_node)                # LLM synthesize market + news + extract + RAG context (hybrid only)
 workflow.add_node("generation", generation_node)      # LLM response generation
 workflow.add_node("formatter", formatter_node)        # Normalize structured_data + citations
@@ -2740,11 +2733,13 @@ File: `tools/rerank_tool.py`
 
 Responsibilities:
 - take top-8 chunks + user query
-- LLM evaluates relevance of each chunk
-- select top-4 most relevant chunks
+- CrossEncoder scores each chunk against query
+- select top-4 most relevant chunks by score
 - return ordered list of chunks (most relevant first)
 
-Rerank prompt approach: present all 8 chunks with IDs, ask LLM to select the 4 most relevant ones by ID.
+Implementation: uses `sentence_transformers.CrossEncoder` with `BAAI/bge-reranker-base`
+(278M params, runs on local CPU). Scores are computed in batch via `model.predict()`,
+wrapped in `asyncio.to_thread()` to avoid blocking the event loop.
 
 ---
 
@@ -2850,8 +2845,7 @@ MINIMAX_MODEL=gpt-4o
 prompts/
 ├── system/          # Main system prompt
 ├── market/          # Market analysis prompts
-├── rag/             # RAG generation + rerank prompts
-├── rerank/          # Rerank selection prompts
+├── rag/             # RAG generation prompt
 ├── formatting/      # Structured output formatting prompts
 ├── intent/          # Intent classification prompt
 ├── rejection/       # Unsupported query rejection prompt
@@ -4160,7 +4154,6 @@ This applies to:
 - Intent classification → `IntentResult`
 - Structured data extraction → `StructuredData`
 - Citations extraction → `list[Citation]`
-- Rerank selection → `RerankSelection`
 
 ---
 
@@ -4582,8 +4575,7 @@ The project intentionally excludes:
 - portfolio tracking (watchlist, holdings)
 - multi-agent architecture (specialist agents)
 - WebSocket streaming (bidirectional)
-- advanced rerank models (cross-encoder)
-- evaluation framework (RAGAS metrics)
+- advanced rerank evaluation framework (RAGAS metrics)
 - deployment pipeline (CI/CD, Docker)
 
 ---
@@ -4606,7 +4598,7 @@ SQLite (relational, via SQLAlchemy) + Chroma (vector, via langchain-chroma, pers
 
 RAG:
 langchain-huggingface (BAAI/bge-small-zh-v1.5) + langchain-chroma retrieval
-+ langchain-text-splitters (RecursiveCharacterTextSplitter) + LLM rerank
++ langchain-text-splitters (RecursiveCharacterTextSplitter) + local CrossEncoder rerank
 Document loading: langchain-community PyPDFLoader (PDF) + raw text (.md, .txt)
 
 Web Search:
@@ -4692,6 +4684,7 @@ maintain consistency with the rest of the codebase.
 | Chroma library | langchain-chroma (not raw chromadb) |
 | Chroma collection | `financial_knowledge` |
 | Embedding library | langchain-huggingface (HuggingFaceEmbeddings) |
+| Reranker model | BAAI/bge-reranker-base (sentence_transformers CrossEncoder) |
 | Knowledge base | `./knowledge_base/` (pre-loaded with 3 Chinese docs) |
 | Documents pre-loaded | `pe_ratio.md`, `dcf_valuation.md`, `ebitda.md` (all Chinese) |
 | Chunk size | 800 chars |
