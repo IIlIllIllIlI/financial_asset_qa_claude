@@ -2,7 +2,7 @@
 
 import asyncio
 import re
-from typing import Any
+from typing import Any, Literal
 
 from cachetools import TTLCache
 from pydantic import BaseModel
@@ -10,6 +10,7 @@ from pydantic import BaseModel
 from app.config.constants import MARKET_CACHE_MAXSIZE, MARKET_CACHE_TTL
 from app.utils.errors import MarketAPIError
 from app.utils.logger import setup_logger
+from app.utils.prompt_loader import load_prompt
 
 logger = setup_logger("tools.market")
 
@@ -43,6 +44,12 @@ market_cache: TTLCache = TTLCache(maxsize=MARKET_CACHE_MAXSIZE, ttl=MARKET_CACHE
 
 class TickerList(BaseModel):
     tickers: list[str]
+
+
+class TickerDecision(BaseModel):
+    action: Literal["direct", "search"]
+    tickers: list[str] = []
+    search_query: str = ""
 
 
 def _fetch_market_data_sync(symbol: str) -> dict:
@@ -168,31 +175,69 @@ def _extract_tickers_regex(query: str) -> list[str]:
     return list(dict.fromkeys(tickers))  # dedup preserving order
 
 
+async def _do_tavily_search_for_ticker(search_query: str) -> str:
+    """Run a single Tavily search and return formatted results text."""
+    # Late import to avoid circular dependency at module level
+    from app.tools.tavily_search_tool import search_news
+
+    results = await search_news(search_query)
+    if not results:
+        return "(无搜索结果)"
+
+    lines = []
+    for i, r in enumerate(results[:3]):
+        title = r.get("title", "")
+        content = r.get("content", "")
+        lines.append(f"[{i}] {title}\n{content}")
+    return "\n\n".join(lines)
+
+
 async def extract_tickers(query: str, model) -> list[str]:
-    """Extract ticker symbols from query via LLM function_calling with fallback."""
-    # Always try regex-based extraction first (fast and reliable)
+    """Extract ticker symbols via two-phase LLM with optional Tavily search."""
+    # Phase 0: regex + Chinese name mapping (fast, no LLM)
     regex_tickers = _extract_tickers_regex(query)
     if regex_tickers:
         logger.info(f"Regex extracted tickers: {regex_tickers}")
         return regex_tickers
 
-    # Try LLM-based extraction with retries (MiniMax reasoning mode is inconsistent)
-    for attempt in range(3):
-        try:
-            structured_llm = model.with_structured_output(TickerList, method="function_calling")
-            result = await structured_llm.ainvoke(
-                f"Extract all stock ticker symbols from this query. Only return valid ticker symbols (e.g., TSLA, AAPL, NVDA). Return empty list if none found.\n\nQuery: {query}"
-            )
-            if result is not None:
-                tickers = (
-                    result.tickers if isinstance(result, TickerList)
-                    else (result.get("tickers", []) if isinstance(result, dict) else [])
-                )
-                if isinstance(tickers, list) and tickers:
-                    logger.info(f"LLM extracted tickers (attempt {attempt + 1}): {tickers}")
-                    return [t.upper().strip() for t in tickers if t and isinstance(t, str)]
-        except Exception as e:
-            logger.warning(f"Ticker extraction attempt {attempt + 1} failed: {e}")
+    # Phase 1: LLM decides — direct mapping or search needed
+    try:
+        decision_llm = model.with_structured_output(TickerDecision, method="function_calling")
+        prompt = load_prompt("market/ticker_decision.txt").format(user_query=query)
+        decision = await decision_llm.ainvoke(prompt)
 
-    logger.warning("All ticker extraction attempts returned empty")
-    return []
+        if decision.action == "direct":
+            tickers = _normalize_tickers(decision.tickers)
+            if tickers:
+                logger.info(f"LLM direct tickers: {tickers}")
+                return tickers
+            logger.info("LLM returned direct action with empty tickers")
+            return []
+
+        # Phase 2: search → extract
+        if decision.action == "search" and decision.search_query:
+            logger.info(f"LLM requested search: {decision.search_query}")
+            search_text = await _do_tavily_search_for_ticker(decision.search_query)
+
+            extract_llm = model.with_structured_output(TickerList, method="function_calling")
+            extract_prompt = load_prompt("market/ticker_from_search.txt").format(
+                user_query=query, search_results=search_text
+            )
+            result = await extract_llm.ainvoke(extract_prompt)
+            tickers = _normalize_tickers(result.tickers if isinstance(result, TickerList)
+                                         else result.get("tickers", []) if isinstance(result, dict)
+                                         else [])
+            logger.info(f"LLM extracted tickers from search: {tickers}")
+            return tickers
+
+        logger.warning("LLM decision action unknown or search_query empty")
+        return []
+
+    except Exception as e:
+        logger.error(f"Ticker extraction failed: {e}")
+        return []
+
+
+def _normalize_tickers(tickers: list[str]) -> list[str]:
+    """Deduplicate and normalize ticker symbols."""
+    return list(dict.fromkeys(t.upper().strip() for t in tickers if t and isinstance(t, str)))

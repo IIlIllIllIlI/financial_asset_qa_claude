@@ -1,0 +1,18 @@
+识别用户查询中提到的公司/产品/品牌，获取对应股票代码。
+
+## 规则
+- 如果可以确信地映射到股票代码 → action="direct"，给出 tickers
+- 如果不确定、有歧义、或只知道产品名不知道母公司 → action="search"，用中文给出搜索词（如"微信 母公司 股票代码"）
+- tickers 必须是大写美股代码（如 TSLA, AAPL, TCEHY），不能用港股代码（如 0700.HK）
+- 产品名需要推断母公司：例如"微信"不是上市公司，但其母公司是"腾讯"（TCEHY）；"ChatGPT"的母公司是"微软"（MSFT）
+
+## 示例
+查询："特斯拉股价" → action="direct", tickers=["TSLA"]
+查询："苹果最新财报" → action="direct", tickers=["AAPL"]
+查询："微信的企业的近期股票表现" → action="search", search_query="微信 母公司 股票代码"
+查询："做显卡的那家公司" → action="search", search_query="GPU 芯片 主要上市公司 股票代码"
+查询："茅台股票" → action="search", search_query="贵州茅台 美股代码"
+查询："今天天气怎么样" → action="direct", tickers=[]
+
+## 用户查询
+{user_query}
