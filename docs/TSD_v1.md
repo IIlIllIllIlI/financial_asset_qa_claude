@@ -476,14 +476,13 @@ Intent examples:
 User Query → Intent Node (routes to "market")
     ↓
 Market Data Tool Node (market_node)
-    ├── Phase 0 — Regex + Chinese Name Mapping: fast path, no LLM
-    │   (matches uppercase tickers + known Chinese company names in _CN_NAME_TO_TICKER)
-    ├── Phase 1 — LLM Decision (TickerDecision schema): action="direct"
-    │   (confident mapping → output tickers) or action="search" (uncertain → output
-    │   Chinese search query, e.g. "微信 母公司 股票代码")
+    ├── Phase 1 — LLM Decision (TickerDecision schema): mapping table fed as context
+    │   (not gate). LLM evaluates every company/product in the query: action="direct"
+    │   (confident → output all tickers, skipping unlisted companies) or action="search"
+    │   (any uncertainty → output Chinese search query)
     ├── Phase 2 — Tavily Search + LLM Extract (TickerList schema): only triggered
-    │   by action="search". Runs one Tavily search, feeds results to LLM for ticker
-    │   extraction. Cannot loop back — schema structurally prevents another search
+    │   by action="search". Single Tavily search (pure query, no "stock news" suffix),
+    │   feeds results to LLM for ticker extraction. Schema prevents another search
     ├── Data Fetching: for each ticker, fetch price + history from Yahoo Finance
     │   (multi-asset = asyncio.gather for parallel fetching)
     ├── Normalize + cache results per ticker (TTLCache, 60s TTL)
@@ -611,9 +610,9 @@ The system supports queries involving multiple stock tickers (e.g., "Compare TSL
 
 ### Backend
 
-- **Ticker Extraction:** Two-phase: regex+mapping (fast path) → LLM `TickerDecision`
-  (direct or search). If LLM requests search, Tavily runs once, then LLM extracts tickers
-  from results via `TickerList` schema.
+- **Ticker Extraction:** Two-phase LLM: mapping table as context (not gate) →
+  `TickerDecision` (direct or search). All companies evaluated by LLM; unlisted
+  ones are skipped. If search needed, Tavily runs once (pure query, no suffix).
 - **Data Fetching:** Yahoo Finance data is fetched **in parallel** for all tickers
   via `asyncio.gather(asyncio.to_thread(...) for each ticker)`. Results are stored
   in `state["market_data"]` keyed by symbol.
@@ -2603,15 +2602,15 @@ async def classify_intent(
 File: `tools/market_data_tool.py`
 
 Responsibilities:
-- **Ticker extraction (two-phase):** Three layers:
-  1. *Phase 0 (regex + Chinese name mapping):* fast path, no LLM — matches uppercase
-     tickers and known Chinese company names in `_CN_NAME_TO_TICKER` dict
-  2. *Phase 1 (LLM Decision):* `TickerDecision` schema — LLM chooses `action="direct"`
-     (confident mapping → output tickers) or `action="search"` (uncertain → output
-     Chinese search query)
-  3. *Phase 2 (Tavily Search + Extract):* only triggered by `action="search"` — backend
-     runs single Tavily search, then LLM with `TickerList` schema extracts tickers from
-     results. Structurally cannot loop (Phase 2 schema has no `action` field)
+- **Ticker extraction (two-phase LLM):** Mapping table (`_CN_NAME_TO_TICKER`) is fed as
+  context, NOT used as a hard pre-filter. Two phases:
+  1. *Phase 1 (LLM Decision):* `TickerDecision` schema — mapping context + query → LLM
+     evaluates every company/product in the query. `action="direct"` (confident → output
+     all tickers, skip unlisted) or `action="search"` (any uncertainty → output Chinese
+     search query)
+  2. *Phase 2 (Tavily Search + Extract):* only triggered by `action="search"` — backend
+     runs single Tavily search with pure query (no "stock news" suffix), then LLM with
+     `TickerList` schema extracts tickers. Phase 2 schema has no `action` field → cannot loop
 - fetch real-time stock price via `yfinance.Ticker(symbol).info`
 - fetch historical data via `yfinance.Ticker(symbol).history(period="30d")`
 - normalize output to standard dict format

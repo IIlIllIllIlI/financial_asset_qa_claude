@@ -1,7 +1,6 @@
 """Yahoo Finance market data tool with TTLCache."""
 
 import asyncio
-import re
 from typing import Any, Literal
 
 from cachetools import TTLCache
@@ -14,7 +13,7 @@ from app.utils.prompt_loader import load_prompt
 
 logger = setup_logger("tools.market")
 
-# Chinese company name → ticker mapping for fuzzy matching
+# Chinese company name → ticker mapping — fed to LLM as reference context, NOT used as a hard gate.
 _CN_NAME_TO_TICKER: dict[str, str] = {
     "特斯拉": "TSLA",
     "苹果": "AAPL",
@@ -158,34 +157,33 @@ async def fetch_all_market_data(tickers: list[str]) -> dict[str, dict]:
     return result_dict
 
 
-def _extract_tickers_regex(query: str) -> list[str]:
-    """Extract tickers using regex and Chinese name mapping — reliable fallback."""
-    tickers: list[str] = []
-
-    # Match uppercase ticker patterns like TSLA, AAPL
-    uppercase = re.findall(r"\b([A-Z]{2,5})\b", query)
-    tickers.extend(t.upper() for t in uppercase)
-
-    # Match known Chinese company names
-    query_lower = query.lower()
+def _build_mapping_context() -> str:
+    """Format the known mapping table as reference text for LLM."""
+    lines = ["已知的中文公司名 → 美股代码映射（供参考）："]
     for name, ticker in _CN_NAME_TO_TICKER.items():
-        if name.lower() in query_lower:
-            tickers.append(ticker)
-
-    return list(dict.fromkeys(tickers))  # dedup preserving order
+        lines.append(f"  {name} → {ticker}")
+    return "\n".join(lines)
 
 
 async def _do_tavily_search_for_ticker(search_query: str) -> str:
-    """Run a single Tavily search and return formatted results text."""
-    # Late import to avoid circular dependency at module level
-    from app.tools.tavily_search_tool import search_news
+    """Run a single Tavily search (pure, no 'stock news' suffix) for ticker lookup."""
+    from langchain_tavily import TavilySearch
+    from app.config.settings import get_settings
 
-    results = await search_news(search_query)
-    if not results:
+    settings = get_settings()
+    tool = TavilySearch(
+        max_results=5,
+        tavily_api_key=settings.tavily_api_key,
+    )
+    logger.info(f"Ticker search: {search_query}")
+    result = await tool.ainvoke({"query": search_query})
+
+    items = result.get("results", []) if isinstance(result, dict) else (result if isinstance(result, list) else [])
+    if not items:
         return "(无搜索结果)"
 
     lines = []
-    for i, r in enumerate(results[:3]):
+    for i, r in enumerate(items[:5]):
         title = r.get("title", "")
         content = r.get("content", "")
         lines.append(f"[{i}] {title}\n{content}")
@@ -193,35 +191,35 @@ async def _do_tavily_search_for_ticker(search_query: str) -> str:
 
 
 async def extract_tickers(query: str, model) -> list[str]:
-    """Extract ticker symbols via two-phase LLM with optional Tavily search."""
-    # Phase 0: regex + Chinese name mapping (fast, no LLM)
-    regex_tickers = _extract_tickers_regex(query)
-    if regex_tickers:
-        logger.info(f"Regex extracted tickers: {regex_tickers}")
-        return regex_tickers
+    """Extract ticker symbols via LLM, with mapping table as context and optional Tavily search.
 
-    # Phase 1: LLM decides — direct mapping or search needed
+    No pre-filter — all company names/products in the query are evaluated by LLM.
+    """
+    mapping_context = _build_mapping_context()
+
     try:
         decision_llm = model.with_structured_output(TickerDecision, method="function_calling")
-        prompt = load_prompt("market/ticker_decision.txt").format(user_query=query)
+        prompt = load_prompt("market/ticker_decision.txt").format(
+            user_query=query,
+            mapping_context=mapping_context,
+        )
         decision = await decision_llm.ainvoke(prompt)
 
         if decision.action == "direct":
             tickers = _normalize_tickers(decision.tickers)
-            if tickers:
-                logger.info(f"LLM direct tickers: {tickers}")
-                return tickers
-            logger.info("LLM returned direct action with empty tickers")
-            return []
+            logger.info(f"LLM direct tickers: {tickers}")
+            return tickers
 
-        # Phase 2: search → extract
+        # Phase 2: search → extract (single round, no retry)
         if decision.action == "search" and decision.search_query:
             logger.info(f"LLM requested search: {decision.search_query}")
             search_text = await _do_tavily_search_for_ticker(decision.search_query)
 
             extract_llm = model.with_structured_output(TickerList, method="function_calling")
             extract_prompt = load_prompt("market/ticker_from_search.txt").format(
-                user_query=query, search_results=search_text
+                user_query=query,
+                search_results=search_text,
+                mapping_context=mapping_context,
             )
             result = await extract_llm.ainvoke(extract_prompt)
             tickers = _normalize_tickers(result.tickers if isinstance(result, TickerList)
