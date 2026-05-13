@@ -15,7 +15,7 @@ logger = setup_logger("api.rag")
 router = APIRouter(prefix="/api/rag", tags=["rag"])
 
 ALLOWED_EXTENSIONS = {".pdf", ".md", ".txt"}
-KNOWLEDGE_BASE_DIR = Path(__file__).parent.parent.parent.parent / "knowledge_base"
+KNOWLEDGE_BASE_DIR = Path(__file__).parent.parent.parent.parent.parent / "knowledge_base"
 
 
 @router.post("/upload", response_model=UploadResponse)
