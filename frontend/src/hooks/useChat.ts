@@ -3,6 +3,16 @@ import { useQueryClient } from "@tanstack/react-query";
 import { streamChat } from "@/services/sse/sseClient";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useChatStore } from "@/stores/chatStore";
+import type { SessionDetail, ChatMessageItem } from "@/types/session";
+
+function makeOptimisticMessage(content: string): ChatMessageItem {
+  return {
+    id: `optimistic-${Date.now()}`,
+    role: "user",
+    content,
+    created_at: new Date().toISOString(),
+  };
+}
 
 export function useChat() {
   const queryClient = useQueryClient();
@@ -13,6 +23,18 @@ export function useChat() {
     async (query: string) => {
       if (!activeSessionId || !query.trim()) return;
 
+      const trimmed = query.trim();
+
+      // 乐观写入用户消息，让用户即刻看到自己发送的内容
+      const optimisticMsg = makeOptimisticMessage(trimmed);
+      queryClient.setQueryData<SessionDetail>(
+        ["session", activeSessionId],
+        (old) => {
+          if (!old) return old;
+          return { ...old, messages: [...old.messages, optimisticMsg] };
+        }
+      );
+
       store.resetStreamingState();
       store.setIsStreaming(true);
 
@@ -20,7 +42,7 @@ export function useChat() {
 
       try {
         await streamChat(
-          { session_id: activeSessionId, query: query.trim(), stream: true },
+          { session_id: activeSessionId, query: trimmed, stream: true },
           {
             onStatus: (_node, _status) => {
               const statusMessages: Record<string, string> = {
@@ -54,6 +76,10 @@ export function useChat() {
             onError: (error) => {
               store.setError(error);
               store.setIsStreaming(false);
+              // 移除乐观消息，触发重新拉取
+              queryClient.invalidateQueries({
+                queryKey: ["session", activeSessionId],
+              });
             },
           },
           abortController.signal
@@ -66,6 +92,9 @@ export function useChat() {
           });
         }
         store.setIsStreaming(false);
+        queryClient.invalidateQueries({
+          queryKey: ["session", activeSessionId],
+        });
       }
     },
     [activeSessionId, store, queryClient]

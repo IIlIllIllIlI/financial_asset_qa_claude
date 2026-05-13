@@ -101,7 +101,7 @@ generation_node → queue.put({type: "token", content: "..."})
 
 ### E2E 测试注意事项
 - **MiniMax M2.7 延迟不稳定**：15–120 秒，测试等待用户消息需 90s timeout
-- **用户消息不本地添加**：仅在 SSE 流结束后由 React Query 从后端加载，`sendMessage` 不写本地
+- **用户消息乐观更新**：`useChat.sendMessage` 在发 SSE 请求前用 `queryClient.setQueryData` 乐观写入缓存，用户即刻看到消息
 - **Turbopack HMR**：阻止 Playwright `page.goto` 的 `load` 事件，用 `waitUntil: "domcontentloaded"`
 - **next-themes**：`ThemeProvider` 的 `setTheme` 在 Playwright 中不触发 React 重渲染，测试中用 `page.evaluate` 直接操作 class
 - **Sidebar 污染**：`getByText("TSLA")` 会匹配侧边栏 session 标题，用 `.locator(".w-80").getByText(...)` 限定范围
