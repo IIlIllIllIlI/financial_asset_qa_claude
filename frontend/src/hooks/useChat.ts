@@ -1,4 +1,5 @@
 import { useCallback } from "react";
+import { flushSync } from "react-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import { streamChat } from "@/services/sse/sseClient";
 import { postChatNonStreaming } from "@/services/api/chat";
@@ -67,8 +68,10 @@ export function useChat() {
                 store.setStatusMessage(statusMessages[_node] || _node);
               },
               onToken: (content) => {
-                store.setStatusMessage(null);
-                store.appendToken(content);
+                flushSync(() => {
+                  store.setStatusMessage(null);
+                  store.appendToken(content);
+                });
               },
               onStructuredData: (data) => {
                 store.setStructuredData(data);

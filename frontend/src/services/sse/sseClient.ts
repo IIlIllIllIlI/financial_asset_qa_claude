@@ -71,7 +71,7 @@ export async function streamChat(
   callbacks: SSECallback,
   signal?: AbortSignal
 ): Promise<void> {
-  const res = await fetch("/api/chat", {
+  const res = await fetch("http://localhost:8000/api/chat", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -107,6 +107,8 @@ export async function streamChat(
             break;
           case "token":
             callbacks.onToken?.(event.content || "");
+            // Yield to event loop so browser paints between tokens
+            await new Promise((resolve) => setTimeout(resolve, 0));
             break;
           case "structured_data":
             callbacks.onStructuredData?.({ assets: (event as Record<string, unknown>).assets as AssetData[] || [] });
@@ -121,8 +123,6 @@ export async function streamChat(
             callbacks.onError?.(event.error || { type: "Unknown", message: "Stream error" });
             break;
         }
-        // Yield to the browser so React can re-render between events
-        await new Promise((resolve) => setTimeout(resolve, 0));
       }
     }
   } finally {

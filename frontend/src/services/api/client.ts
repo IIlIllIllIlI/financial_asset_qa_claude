@@ -1,3 +1,5 @@
+const API_BASE = "http://localhost:8000";
+
 export class ApiError extends Error {
   constructor(
     public status: number,
@@ -18,7 +20,7 @@ async function handleResponse(res: Response) {
 }
 
 export async function apiGet(url: string) {
-  const res = await fetch(url);
+  const res = await fetch(`${API_BASE}${url}`);
   return handleResponse(res);
 }
 
@@ -27,7 +29,7 @@ export async function apiPost(url: string, body?: unknown) {
   if (body !== undefined) {
     headers["Content-Type"] = "application/json";
   }
-  const res = await fetch(url, {
+  const res = await fetch(`${API_BASE}${url}`, {
     method: "POST",
     headers,
     body: body !== undefined ? JSON.stringify(body) : undefined,
@@ -36,7 +38,7 @@ export async function apiPost(url: string, body?: unknown) {
 }
 
 export async function apiPatch(url: string, body: unknown) {
-  const res = await fetch(url, {
+  const res = await fetch(`${API_BASE}${url}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -45,6 +47,6 @@ export async function apiPatch(url: string, body: unknown) {
 }
 
 export async function apiDelete(url: string) {
-  const res = await fetch(url, { method: "DELETE" });
+  const res = await fetch(`${API_BASE}${url}`, { method: "DELETE" });
   return handleResponse(res);
 }
