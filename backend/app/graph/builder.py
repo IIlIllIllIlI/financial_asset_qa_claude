@@ -101,4 +101,8 @@ def get_compiled_graph():
         workflow = create_graph()
         _compiled_graph = workflow.compile(checkpointer=False)
         logger.info("LangGraph compiled")
+
+        from app.utils.graph_viz import show_graph_image
+        show_graph_image(_compiled_graph)
+
     return _compiled_graph
